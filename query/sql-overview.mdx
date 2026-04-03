@@ -1,0 +1,354 @@
+---
+title: 'SQL overview'
+description: 'Apache Doris is fully MySQL-compatible and supports standard SQL for analytics.'
+keywords: ['sql', 'mysql', 'ddl', 'dml', 'window functions', 'bitmap', 'hll', 'analytical functions']
+---
+
+Apache Doris implements the MySQL 8.0 wire protocol and supports standard ANSI SQL. Any MySQL-compatible client, driver, or BI tool can connect without modification.
+
+## MySQL compatibility
+
+Doris speaks the MySQL 8.0 client/server protocol. That means:
+
+- Any tool that works with MySQL works with Doris: MySQL CLI, DBeaver, Tableau, Superset, Grafana, and more.
+- Most MySQL scalar functions, operators, and syntax are supported.
+- The default port for the Frontend (FE) query service is **9030**.
+
+<Note>
+Doris does not support MySQL's storage engine interfaces (InnoDB, MyISAM). It is an OLAP system — do not expect row-level transactional workloads outside of the Unique Key model.
+</Note>
+
+## Connecting to Doris
+
+<Tabs>
+  <Tab title="MySQL CLI">
+    ```bash
+    mysql -h 127.0.0.1 -P 9030 -u root -p
+    ```
+
+    After connecting, select a database:
+
+    ```sql
+    USE mydb;
+    ```
+  </Tab>
+  <Tab title="JDBC">
+    Use any MySQL JDBC driver (e.g., `mysql-connector-java`):
+
+    ```
+    jdbc:mysql://doris-fe:9030/mydb?characterEncoding=utf8&useSSL=false
+    ```
+
+    ```java
+    Connection conn = DriverManager.getConnection(
+        "jdbc:mysql://doris-fe:9030/mydb?characterEncoding=utf8",
+        "root", "");
+    ```
+  </Tab>
+  <Tab title="Python">
+    Install `PyMySQL`:
+
+    ```bash
+    pip install PyMySQL
+    ```
+
+    ```python
+    import pymysql
+
+    conn = pymysql.connect(
+        host="127.0.0.1",
+        port=9030,
+        user="root",
+        password="",
+        database="mydb",
+        charset="utf8"
+    )
+
+    with conn.cursor() as cursor:
+        cursor.execute("SELECT COUNT(*) FROM orders")
+        print(cursor.fetchone())
+
+    conn.close()
+    ```
+  </Tab>
+  <Tab title="Go">
+    Use the standard `go-sql-driver/mysql` driver:
+
+    ```bash
+    go get github.com/go-sql-driver/mysql
+    ```
+
+    ```go
+    import (
+        "database/sql"
+        _ "github.com/go-sql-driver/mysql"
+    )
+
+    db, err := sql.Open("mysql", "root:@tcp(127.0.0.1:9030)/mydb?charset=utf8")
+    if err != nil {
+        panic(err)
+    }
+    defer db.Close()
+    ```
+  </Tab>
+</Tabs>
+
+## DDL
+
+### CREATE DATABASE
+
+```sql
+CREATE DATABASE IF NOT EXISTS sales;
+USE sales;
+```
+
+### CREATE TABLE
+
+Doris tables require a **Keys Type** (data model) and a **distribution** clause. Partitioning is optional but strongly recommended for time-series data.
+
+```sql
+CREATE TABLE IF NOT EXISTS events (
+    event_date  DATE          NOT NULL,
+    event_time  DATETIME      NOT NULL,
+    user_id     BIGINT        NOT NULL,
+    event_type  VARCHAR(64)   NOT NULL,
+    properties  STRING
+)
+DUPLICATE KEY(event_date, user_id)
+PARTITION BY RANGE(event_date) (
+    PARTITION p2024_01 VALUES LESS THAN ("2024-02-01"),
+    PARTITION p2024_02 VALUES LESS THAN ("2024-03-01"),
+    PARTITION p2024_03 VALUES LESS THAN ("2024-04-01")
+)
+DISTRIBUTED BY HASH(user_id) BUCKETS 16
+PROPERTIES (
+    "replication_num" = "3",
+    "dynamic_partition.enable" = "true",
+    "dynamic_partition.time_unit" = "MONTH",
+    "dynamic_partition.start" = "-3",
+    "dynamic_partition.end" = "1",
+    "dynamic_partition.prefix" = "p"
+);
+```
+
+The four key types map to the `KeysType` enum in the catalog:
+
+| Key type | SQL keyword | Deduplication | Use case |
+|---|---|---|---|
+| `DUP_KEYS` | `DUPLICATE KEY` | None | Event logs, raw data |
+| `AGG_KEYS` | `AGGREGATE KEY` | Merge by pre-defined agg | Pre-aggregated metrics |
+| `UNIQUE_KEYS` | `UNIQUE KEY` | Last-write-wins | Mutable dimension tables |
+| `PRIMARY_KEYS` | `PRIMARY KEY` | Merge-on-write | High-frequency upserts |
+
+### ALTER TABLE
+
+```sql
+-- Add a column
+ALTER TABLE events ADD COLUMN country VARCHAR(32) DEFAULT 'unknown' AFTER event_type;
+
+-- Rename a column
+ALTER TABLE events RENAME COLUMN country region;
+
+-- Modify column type (widening only)
+ALTER TABLE events MODIFY COLUMN user_id LARGEINT;
+
+-- Add a partition
+ALTER TABLE events ADD PARTITION p2024_04 VALUES LESS THAN ("2024-05-01");
+```
+
+### DROP TABLE
+
+```sql
+DROP TABLE IF EXISTS events;
+```
+
+## DML
+
+### INSERT INTO
+
+```sql
+-- Single-row insert
+INSERT INTO events (event_date, event_time, user_id, event_type)
+VALUES ('2024-01-15', '2024-01-15 10:30:00', 12345, 'click');
+
+-- Multi-row insert
+INSERT INTO events (event_date, event_time, user_id, event_type)
+VALUES
+    ('2024-01-15', '2024-01-15 10:30:00', 12345, 'click'),
+    ('2024-01-15', '2024-01-15 10:31:00', 67890, 'purchase');
+```
+
+### INSERT INTO ... SELECT
+
+The standard pattern for ETL within Doris:
+
+```sql
+INSERT INTO events_archive
+SELECT * FROM events
+WHERE event_date < '2024-01-01';
+```
+
+### UPDATE
+
+Only supported on **Unique Key** and **Primary Key** tables:
+
+```sql
+UPDATE orders
+SET status = 'shipped', updated_at = NOW()
+WHERE order_id = 100001;
+```
+
+### DELETE
+
+```sql
+-- Delete by predicate (all models)
+DELETE FROM events WHERE event_date < '2023-01-01';
+
+-- DELETE with JOIN (Unique/Primary Key tables only)
+DELETE FROM orders
+USING cancelled_orders c
+WHERE orders.order_id = c.order_id;
+```
+
+## Analytical functions
+
+### Window functions
+
+Window functions compute results across a sliding window of rows without collapsing the result set.
+
+```sql
+SELECT
+    user_id,
+    order_date,
+    amount,
+    -- Row number within each user partition, ordered by date
+    ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY order_date)    AS rn,
+    -- Dense rank by amount descending
+    DENSE_RANK()  OVER (PARTITION BY user_id ORDER BY amount DESC)  AS dr,
+    -- Regular rank (gaps on ties)
+    RANK()        OVER (PARTITION BY user_id ORDER BY amount DESC)  AS rnk,
+    -- Previous order amount for the same user
+    LAG(amount, 1, 0)  OVER (PARTITION BY user_id ORDER BY order_date) AS prev_amount,
+    -- Next order amount
+    LEAD(amount, 1, 0) OVER (PARTITION BY user_id ORDER BY order_date) AS next_amount,
+    -- Running total per user
+    SUM(amount)   OVER (PARTITION BY user_id ORDER BY order_date
+                        ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS running_total
+FROM orders;
+```
+
+### Common aggregate functions
+
+```sql
+SELECT
+    region,
+    COUNT(*)                         AS total_orders,
+    COUNT(DISTINCT user_id)          AS unique_customers,
+    SUM(amount)                      AS revenue,
+    AVG(amount)                      AS avg_order_value,
+    MAX(amount)                      AS max_order,
+    MIN(amount)                      AS min_order,
+    APPROX_COUNT_DISTINCT(user_id)   AS approx_unique_customers  -- NDV estimate, faster than COUNT(DISTINCT)
+FROM orders
+WHERE order_date >= '2024-01-01'
+GROUP BY region;
+```
+
+## BITMAP and HLL functions
+
+BITMAP and HyperLogLog (HLL) are first-class column types in Doris designed for fast approximate or exact distinct-count analytics at scale without counting individual rows at query time.
+
+```sql
+-- HyperLogLog: fast approximate distinct count across partitions
+-- HLL_UNION_AGG merges HLL sketches stored per partition
+SELECT HLL_UNION_AGG(uv) AS approx_unique_visitors
+FROM site_stats
+WHERE stat_date = '2024-01-01';
+
+-- BITMAP: exact distinct count using pre-computed user bitmaps
+-- BITMAP_UNION_COUNT counts the union of all bitmap columns
+SELECT BITMAP_UNION_COUNT(user_bitmap) AS exact_unique_users
+FROM user_actions
+WHERE dt = '2024-01-01';
+
+-- Build a BITMAP from integer IDs on the fly
+SELECT BITMAP_UNION_COUNT(BITMAP_FROM_ARRAY(user_ids)) AS dau
+FROM daily_active_sets
+WHERE event_date BETWEEN '2024-01-01' AND '2024-01-07';
+```
+
+<Tip>
+Store HLL columns as `HLL` type and BITMAP columns as `BITMAP` type in Aggregate Key tables. Populate them with `HLL_HASH(col)` and `TO_BITMAP(col)` respectively during load.
+</Tip>
+
+## Doris-specific functions
+
+| Function | Description | Example |
+|---|---|---|
+| `YEARS_DIFF(end, start)` | Integer year difference | `YEARS_DIFF(NOW(), birthday)` |
+| `MONTHS_DIFF(end, start)` | Integer month difference | `MONTHS_DIFF('2024-03-01', '2024-01-01')` → 2 |
+| `DAYS_DIFF(end, start)` | Integer day difference | `DAYS_DIFF(NOW(), created_at)` |
+| `ARRAY_AGG(col)` | Collect values into an array | `ARRAY_AGG(tag) GROUP BY user_id` |
+| `COLLECT_LIST(col)` | Alias for `ARRAY_AGG` | same as above |
+| `GROUP_CONCAT(col, sep)` | Concatenate strings with separator | `GROUP_CONCAT(name, ', ')` |
+| `EXPLODE_BITMAP(bitmap_col)` | Table-function: expand bitmap to rows | See lateral join |
+| `TOPN(col, n)` | Return the top-N most frequent values | `TOPN(product_id, 10)` |
+
+**Example — bitmap explode:**
+
+```sql
+SELECT user_id, exploded_id
+FROM user_actions
+LATERAL VIEW EXPLODE_BITMAP(user_bitmap) tmp AS exploded_id
+WHERE dt = '2024-01-01'
+LIMIT 1000;
+```
+
+## Session variables
+
+Session variables adjust query behavior for the current connection. Use `SET` to apply them.
+
+```sql
+-- Increase parallelism (number of scan/exchange instances per fragment)
+SET parallel_fragment_exec_instance_num = 8;
+
+-- Set memory limit for a single query
+SET exec_mem_limit = 8589934592;  -- 8 GB in bytes
+-- or use human-readable notation
+SET exec_mem_limit = '8g';
+
+-- Set query timeout (seconds)
+SET query_timeout = 300;
+
+-- Enable/disable the Nereids CBO optimizer (enabled by default)
+SET enable_nereids_planner = true;
+```
+
+You can also pass session variables inline per query using the `SET_VAR` hint — see [Query optimization](/query/query-optimization) for details.
+
+## SHOW commands
+
+```sql
+-- List all databases
+SHOW DATABASES;
+
+-- List tables in the current database
+SHOW TABLES;
+
+-- Show full CREATE TABLE statement (including partitions)
+SHOW CREATE TABLE orders;
+
+-- Show all partitions of a table with their sizes and row counts
+SHOW PARTITIONS FROM events;
+
+-- Show column definitions
+DESCRIBE orders;
+-- or
+DESC orders;
+
+-- Show running queries
+SHOW PROCESSLIST;
+
+-- Show currently set session variables
+SHOW VARIABLES LIKE '%parallel%';
+```

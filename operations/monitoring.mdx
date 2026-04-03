@@ -1,0 +1,192 @@
+---
+title: "Monitoring"
+description: Monitor Apache Doris cluster health, performance metrics, and query profiles.
+---
+
+## Built-in Web UI
+
+The FE exposes a built-in web interface at `http://fe_host:8030` (configured by `http_port` in `fe.conf`). No extra installation is required.
+
+<CardGroup cols={3}>
+  <Card title="Cluster overview" icon="server">
+    FE and BE node status, roles, liveness, and disk utilization at a glance.
+  </Card>
+  <Card title="Query profile viewer" icon="chart-bar">
+    Per-query execution trees with per-operator timing, rows processed, and memory usage.
+  </Card>
+  <Card title="Log viewer" icon="file-text">
+    Browse FE and BE log files without SSH access to individual hosts.
+  </Card>
+</CardGroup>
+
+---
+
+## Prometheus metrics
+
+Both FE and BE expose Prometheus-compatible metrics on their HTTP ports. The endpoint is implemented in `MetricsAction.java` and supports three output formats via the `type` query parameter: Prometheus (default), JSON (`type=json`), and a lightweight core summary (`type=core`).
+
+```bash
+# Scrape FE metrics (Prometheus format by default)
+curl http://fe-host:8030/metrics
+
+# Scrape BE metrics
+curl http://be-host:8040/metrics
+
+# JSON format
+curl http://fe-host:8030/metrics?type=json
+```
+
+### Prometheus scrape configuration
+
+Add the following to your `prometheus.yml`:
+
+```yaml
+scrape_configs:
+  - job_name: 'doris_fe'
+    static_configs:
+      - targets: ['fe-host:8030']
+    metrics_path: '/metrics'
+
+  - job_name: 'doris_be'
+    static_configs:
+      - targets: ['be-host:8040']
+    metrics_path: '/metrics'
+```
+
+For clusters with multiple FE or BE nodes, list all hosts under `targets`:
+
+```yaml
+scrape_configs:
+  - job_name: 'doris_fe'
+    static_configs:
+      - targets:
+          - 'fe1:8030'
+          - 'fe2:8030'
+          - 'fe3:8030'
+    metrics_path: '/metrics'
+
+  - job_name: 'doris_be'
+    static_configs:
+      - targets:
+          - 'be1:8040'
+          - 'be2:8040'
+          - 'be3:8040'
+    metrics_path: '/metrics'
+```
+
+---
+
+## Key metrics to watch
+
+| Metric | Source | Description | Alert threshold |
+|--------|--------|-------------|----------------|
+| `doris_fe_query_total` | FE | Cumulative queries processed | — (use rate) |
+| `doris_fe_query_err` | FE | Cumulative failed queries | > 1% of total rate |
+| `doris_fe_query_latency_ms` (p99) | FE | 99th-percentile query latency | > 5 000 ms |
+| `doris_be_disk_used_capacity_bytes` | BE | Bytes used on each storage path | > 80% of total |
+| `doris_be_tablet_schema_change_running_tasks` | BE | In-progress schema change tasks | — (alert if stuck) |
+| `doris_be_compaction_bytes_total` | BE | Cumulative bytes compacted | — (use rate) |
+| `doris_fe_connection_total` | FE | Active MySQL connections | Approaching `qe_max_connection` |
+| `doris_be_load_bytes` | BE | Cumulative bytes ingested | — (use rate for throughput) |
+
+<Tip>
+Use `rate()` in PromQL for counter metrics (those ending in `_total`). For example: `rate(doris_fe_query_err[5m]) / rate(doris_fe_query_total[5m])` gives the error ratio.
+</Tip>
+
+---
+
+## Audit log
+
+Doris logs every query and DDL operation to `$DORIS_HOME/log/fe.audit.log`. Configure audit behavior in `fe.conf`:
+
+```ini
+# fe.conf
+
+# Log slow queries and all queries (comma-separated)
+audit_log_modules = slow_query, query
+
+# Log queries that exceed this duration (milliseconds)
+qe_slow_log_ms = 5000
+```
+
+The audit log records the user, client IP, database, SQL text, execution time, rows returned, and whether the query succeeded. Feed it into a log aggregation pipeline (Elasticsearch, Loki, etc.) for long-term analysis.
+
+---
+
+## Query profiles
+
+Query profiles capture the full execution plan with per-operator metrics, enabling diagnosis of slow queries.
+
+<Steps>
+  <Step title="Enable profiling for your session">
+    ```sql
+    SET enable_profile = true;
+    ```
+  </Step>
+  <Step title="Run the query you want to profile">
+    ```sql
+    SELECT
+        customer_id,
+        SUM(amount) AS total
+    FROM orders
+    WHERE order_date >= '2024-01-01'
+    GROUP BY customer_id
+    ORDER BY total DESC
+    LIMIT 100;
+    ```
+  </Step>
+  <Step title="View the profile">
+    Open the Web UI at `http://fe:8030` and navigate to **Query Profile**, or fetch it directly via REST:
+
+    ```bash
+    curl http://fe-host:8030/api/profile/query_id/YOUR_QUERY_ID
+    ```
+
+    The profile shows the query ID after execution in the result set header when using the MySQL client.
+  </Step>
+</Steps>
+
+<Note>
+Profiling adds a small overhead. Enable it per session for targeted investigation rather than cluster-wide.
+</Note>
+
+---
+
+## System tables
+
+The `information_schema` database exposes runtime state you can query with standard SQL:
+
+```sql
+-- Active queries currently running on the cluster
+SELECT query_id, user, db, query_start_time, query_time_ms, sql
+FROM information_schema.active_queries
+ORDER BY query_time_ms DESC;
+
+-- Backend storage overview
+SELECT host, data_used_capacity, avail_capacity, tablet_num, alive
+FROM information_schema.backends;
+
+-- Partition statistics for a specific database
+SELECT table_name, partition_name, data_length, table_rows
+FROM information_schema.partitions
+WHERE TABLE_SCHEMA = 'mydb'
+ORDER BY data_length DESC;
+```
+
+---
+
+## Grafana dashboard
+
+The Doris project maintains an official Grafana dashboard that pairs with the Prometheus scrape configuration above.
+
+<Steps>
+  <Step title="Import the dashboard">
+    Download the dashboard JSON from the [Doris community Grafana dashboards](https://github.com/apache/doris/discussions) or build one from the `doris_fe_*` and `doris_be_*` metric families. In Grafana, go to **Dashboards → Import** and paste the JSON or upload the file.
+  </Step>
+  <Step title="Configure the data source">
+    Point the dashboard at your Prometheus instance. The panels use the `doris_fe_*` and `doris_be_*` metric families scraped above.
+  </Step>
+  <Step title="Set up alerts">
+    Use Grafana Alert Rules on the panels for `doris_fe_query_err`, `doris_be_disk_used_capacity_bytes`, and `doris_fe_query_latency_ms` to receive notifications when thresholds are exceeded.
+  </Step>
+</Steps>

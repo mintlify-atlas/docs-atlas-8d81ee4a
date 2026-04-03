@@ -1,0 +1,371 @@
+---
+title: "Hive, Iceberg, and Hudi"
+description: "Connect Apache Doris to Apache Hive, Iceberg, Hudi, and Paimon tables via the catalog system."
+keywords: ["hive", "iceberg", "hudi", "paimon", "hms", "metastore", "catalog", "time travel", "kerberos"]
+---
+
+Doris supports querying open table formats and Hive-compatible tables through the unified catalog API. This page covers creating catalogs for Hive, Iceberg, Hudi, Paimon, and relational databases via JDBC.
+
+<Tabs>
+  <Tab title="Hive">
+
+## Prerequisites
+
+- Hive Metastore 2.x or 3.x running and reachable from Doris FE and BE nodes
+- Storage accessible from Doris BE nodes (HDFS or an S3-compatible object store)
+
+## Create a Hive catalog
+
+The Hive catalog uses catalog `type = "hms"`. Doris connects to the Hive Metastore via the Thrift protocol and reads table data directly from the underlying storage.
+
+```sql
+-- Basic Hive Metastore catalog (HDFS or local storage)
+CREATE CATALOG hive_catalog PROPERTIES (
+    "type" = "hms",
+    "hive.metastore.uris" = "thrift://hms-host:9083",
+    "hadoop.username" = "hdfs"
+);
+```
+
+### With Kerberos authentication
+
+```sql
+CREATE CATALOG hive_kerberos PROPERTIES (
+    "type" = "hms",
+    "hive.metastore.uris" = "thrift://hms-host:9083",
+    "hive.metastore.sasl.enabled" = "true",
+    "hive.metastore.kerberos.principal" = "hive/_HOST@EXAMPLE.COM",
+    "hadoop.kerberos.principal" = "doris@EXAMPLE.COM",
+    "hadoop.kerberos.keytab" = "/etc/security/doris.keytab"
+);
+```
+
+### With S3-compatible object storage
+
+```sql
+CREATE CATALOG hive_s3 PROPERTIES (
+    "type" = "hms",
+    "hive.metastore.uris" = "thrift://hms-host:9083",
+    "s3.endpoint" = "s3.amazonaws.com",
+    "s3.access_key" = "YOUR_ACCESS_KEY",
+    "s3.secret_key" = "YOUR_SECRET_KEY",
+    "s3.region" = "us-east-1"
+);
+```
+
+<Note>
+For S3-compatible stores such as MinIO, set `"use_path_style" = "true"` and point `s3.endpoint` at the MinIO address. See the [Hudi sample](https://github.com/apache/doris/blob/master/samples/datalake/hudi/scripts/doris-hudi.sql) for a working example.
+</Note>
+
+## Query Hive tables
+
+After the catalog is created, Hive tables are accessible via the three-part name or by switching the active catalog:
+
+```sql
+-- Query using three-part name
+SELECT * FROM hive_catalog.mydb.events
+WHERE dt = '2024-01-01'
+LIMIT 100;
+
+-- Switch catalog and query normally
+SWITCH hive_catalog;
+USE mydb;
+SHOW TABLES;
+SELECT COUNT(*) FROM events;
+```
+
+## Cache tuning
+
+The HMS catalog caches file metadata and partition lists in Doris FE. Tune the TTL to match your data freshness requirements:
+
+```sql
+ALTER CATALOG hive_catalog SET PROPERTIES (
+    "file.meta.cache.ttl-second" = "300",
+    "partition.cache.ttl-second" = "600"
+);
+```
+
+Set either value to `-1` to disable the TTL (cache is valid until manually refreshed).
+
+  </Tab>
+  <Tab title="Iceberg">
+
+## Overview
+
+The Iceberg catalog (`type = "iceberg"`) supports multiple catalog backends controlled by the `iceberg.catalog.type` property:
+
+| Backend | Value | When to use |
+|---|---|---|
+| REST | `rest` | Polaris, Nessie, AWS Glue REST endpoint, or any Iceberg REST catalog |
+| Hive Metastore | `hms` | Existing Hive-managed Iceberg tables |
+| AWS Glue | `glue` | Iceberg tables registered in AWS Glue Data Catalog |
+| Hadoop | `hadoop` | Filesystem-based catalog without a metastore |
+| S3 Tables | `s3tables` | AWS S3 Tables (managed Iceberg via S3) |
+| JDBC | `jdbc` | Iceberg tables tracked in a relational database |
+
+Doris automatically routes Iceberg catalog connections based on the `iceberg.catalog.type` property.
+
+## REST catalog
+
+```sql
+CREATE CATALOG iceberg_rest PROPERTIES (
+    "type" = "iceberg",
+    "iceberg.catalog.type" = "rest",
+    "uri" = "http://iceberg-rest-catalog:8181",
+    "token" = "your_bearer_token",
+    "warehouse" = "s3://my-bucket/warehouse/",
+    "s3.endpoint" = "s3.amazonaws.com",
+    "s3.access_key" = "YOUR_ACCESS_KEY",
+    "s3.secret_key" = "YOUR_SECRET_KEY",
+    "s3.region" = "us-east-1"
+);
+```
+
+From the [iceberg_and_paimon sample](https://github.com/apache/doris/blob/master/samples/datalake/iceberg_and_paimon/sql/init_doris.sql), a MinIO-backed REST catalog looks like:
+
+```sql
+CREATE CATALOG iceberg PROPERTIES (
+    "type" = "iceberg",
+    "iceberg.catalog.type" = "rest",
+    "uri" = "http://rest:8181",
+    "warehouse" = "s3://warehouse/",
+    "s3.endpoint" = "http://minio:9000",
+    "s3.access_key" = "admin",
+    "s3.secret_key" = "password",
+    "s3.region" = "us-east-1"
+);
+```
+
+## HMS-backed Iceberg
+
+```sql
+CREATE CATALOG iceberg_hms PROPERTIES (
+    "type" = "iceberg",
+    "iceberg.catalog.type" = "hms",
+    "hive.metastore.uris" = "thrift://hms-host:9083",
+    "s3.endpoint" = "s3.amazonaws.com",
+    "s3.access_key" = "YOUR_ACCESS_KEY",
+    "s3.secret_key" = "YOUR_SECRET_KEY",
+    "s3.region" = "us-east-1"
+);
+```
+
+## AWS Glue catalog
+
+```sql
+CREATE CATALOG iceberg_glue PROPERTIES (
+    "type" = "iceberg",
+    "iceberg.catalog.type" = "glue",
+    "glue.region" = "us-east-1",
+    "glue.access_key" = "YOUR_ACCESS_KEY",
+    "glue.secret_key" = "YOUR_SECRET_KEY",
+    "warehouse" = "s3://my-bucket/warehouse/"
+);
+```
+
+## Time travel
+
+Doris supports Iceberg time travel queries using snapshot IDs or timestamps:
+
+```sql
+-- Query a specific point in time
+SELECT * FROM iceberg_rest.db.orders
+FOR TIME AS OF '2024-01-01 00:00:00';
+
+-- Query a specific snapshot by ID
+SELECT * FROM iceberg_rest.db.orders
+FOR VERSION AS OF 12345;
+```
+
+## Manifest caching
+
+Iceberg manifest files are cached independently of table metadata. Enable manifest caching for tables with many small manifests:
+
+```sql
+ALTER CATALOG iceberg_rest SET PROPERTIES (
+    "meta.cache.iceberg.manifest.enable" = "true",
+    "meta.cache.iceberg.manifest.ttl-second" = "172800",
+    "meta.cache.iceberg.manifest.capacity" = "1024"
+);
+```
+
+  </Tab>
+  <Tab title="Hudi">
+
+## Overview
+
+Hudi tables are accessed through an HMS catalog (`type = "hms"`). Doris detects Hudi tables automatically based on the table's `InputFormat` and `SerDe` class stored in the Hive Metastore. Both table types are supported:
+
+- **Copy-on-Write (CoW)** — reads the latest base files; best for read-heavy workloads
+- **Merge-on-Read (MoR)** — reads base files plus delta logs; reflects the most recent writes
+
+## Create a catalog
+
+```sql
+CREATE CATALOG hudi_catalog PROPERTIES (
+    "type" = "hms",
+    "hive.metastore.uris" = "thrift://hms-host:9083",
+    "s3.endpoint" = "s3.amazonaws.com",
+    "s3.access_key" = "YOUR_ACCESS_KEY",
+    "s3.secret_key" = "YOUR_SECRET_KEY",
+    "s3.region" = "us-east-1"
+);
+```
+
+No special property is required to enable Hudi support — Doris identifies Hudi tables automatically. The same catalog can serve Hive, Hudi, and Delta Lake tables simultaneously.
+
+## Query Hudi tables
+
+```sql
+-- Query the latest snapshot
+SELECT ride_id, driver_id, fare
+FROM hudi_catalog.trips.ride_events
+WHERE partition_date = '2024-01-01';
+```
+
+## Time travel
+
+Hudi time travel uses the `TIMESTAMP AS OF` syntax with a timestamp string in the Hudi instant format:
+
+```sql
+-- Query data as of a specific Hudi instant
+SELECT * FROM hudi_catalog.trips.ride_events
+TIMESTAMP AS OF '20240101000000';
+```
+
+<Note>
+The timestamp format for Hudi time travel (`yyyyMMddHHmmss`) differs from the Iceberg format (`yyyy-MM-dd HH:mm:ss`).
+</Note>
+
+## MoR read optimization
+
+For MoR tables, Doris reads both base Parquet/ORC files and the Avro delta log files and merges them at query time. To reduce merge overhead, compact MoR tables periodically using the Hudi writer (Spark or Flink). Compacted tables appear as CoW and have lower read latency in Doris.
+
+  </Tab>
+  <Tab title="Paimon">
+
+## Overview
+
+Apache Paimon has a native catalog implementation in Doris (`type = "paimon"`). Supported catalog backends, controlled by `paimon.catalog.type`:
+
+| Backend | Value | Notes |
+|---|---|---|
+| Filesystem | `filesystem` (default) | Warehouse directory on HDFS or S3; no separate metastore required |
+| Hive Metastore | `hms` | Tables registered in HMS |
+| REST | `rest` | Paimon REST catalog |
+| JDBC | `jdbc` | Metadata stored in a relational database |
+
+## Filesystem catalog (S3)
+
+```sql
+CREATE CATALOG paimon_catalog PROPERTIES (
+    "type" = "paimon",
+    "warehouse" = "s3://my-bucket/paimon-warehouse/",
+    "s3.endpoint" = "s3.amazonaws.com",
+    "s3.access_key" = "YOUR_ACCESS_KEY",
+    "s3.secret_key" = "YOUR_SECRET_KEY",
+    "s3.region" = "us-east-1"
+);
+```
+
+From the [iceberg_and_paimon sample](https://github.com/apache/doris/blob/master/samples/datalake/iceberg_and_paimon/sql/init_doris.sql), a MinIO-backed Paimon catalog:
+
+```sql
+CREATE CATALOG paimon PROPERTIES (
+    "type" = "paimon",
+    "warehouse" = "s3://warehouse/wh/",
+    "s3.endpoint" = "http://minio:9000",
+    "s3.access_key" = "admin",
+    "s3.secret_key" = "password",
+    "s3.region" = "us-east-1"
+);
+```
+
+## HMS-backed Paimon
+
+```sql
+CREATE CATALOG paimon_hms PROPERTIES (
+    "type" = "paimon",
+    "paimon.catalog.type" = "hms",
+    "hive.metastore.uris" = "thrift://hms-host:9083",
+    "warehouse" = "s3://my-bucket/paimon-warehouse/",
+    "s3.endpoint" = "s3.amazonaws.com",
+    "s3.access_key" = "YOUR_ACCESS_KEY",
+    "s3.secret_key" = "YOUR_SECRET_KEY",
+    "s3.region" = "us-east-1"
+);
+```
+
+## Query Paimon tables
+
+After catalog creation, query Paimon tables with standard SQL:
+
+```sql
+SELECT order_id, customer_id, total_amount
+FROM paimon_catalog.sales.orders
+WHERE order_date >= '2024-01-01'
+ORDER BY order_date DESC
+LIMIT 50;
+```
+
+Paimon's primary key tables support merge-on-read semantics. Doris reads snapshot files and applies changelog data at query time.
+
+  </Tab>
+</Tabs>
+
+## JDBC catalog for relational databases
+
+The `jdbc` catalog type provides direct query federation against any JDBC-compatible relational database. Doris ships with built-in support for MySQL, PostgreSQL, Oracle, SQL Server, ClickHouse, SAP HANA, and others.
+
+<Warning>
+The JDBC driver JAR must be accessible to all Doris BE nodes at the path specified by `driver_url`. Place the JAR in a consistent path on every BE host, or host it over HTTP and use an `http://` URL.
+</Warning>
+
+### MySQL
+
+```sql
+CREATE CATALOG mysql_catalog PROPERTIES (
+    "type" = "jdbc",
+    "user" = "root",
+    "password" = "secret",
+    "jdbc_url" = "jdbc:mysql://mysql-host:3306/mydb",
+    "driver_url" = "file:///path/to/mysql-connector-j-8.0.33.jar",
+    "driver_class" = "com.mysql.cj.jdbc.Driver"
+);
+```
+
+### PostgreSQL
+
+```sql
+CREATE CATALOG pg_catalog PROPERTIES (
+    "type" = "jdbc",
+    "user" = "postgres",
+    "password" = "secret",
+    "jdbc_url" = "jdbc:postgresql://pg-host:5432/mydb",
+    "driver_url" = "file:///path/to/postgresql-42.6.0.jar",
+    "driver_class" = "org.postgresql.Driver"
+);
+```
+
+### Query a JDBC table
+
+```sql
+SELECT order_id, amount, status
+FROM mysql_catalog.mydb.orders
+WHERE status = 'PENDING';
+```
+
+Predicate pushdown for JDBC catalogs translates Doris filter expressions into SQL `WHERE` clauses that execute on the remote database, reducing data transfer.
+
+### Connection pool settings
+
+The JDBC catalog maintains a HikariCP connection pool on each BE node. Tune the pool to match your workload:
+
+```sql
+ALTER CATALOG mysql_catalog SET PROPERTIES (
+    "connection_pool_min_size" = "1",
+    "connection_pool_max_size" = "10",
+    "connection_pool_max_wait_time" = "5000",
+    "connection_pool_max_life_time" = "1800000"
+);
+```

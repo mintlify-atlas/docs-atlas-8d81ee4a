@@ -1,0 +1,99 @@
+{
+  "projectType": "data-platform",
+  "projectName": "Apache Doris",
+  "projectDescription": "Apache Doris is a high-performance, real-time MPP analytical database with columnar storage, vectorized query engine, and unified lakehouse capabilities.",
+  "theme": "maple",
+  "primaryColor": "#0cbc84",
+  "lightColor": "#1a231c",
+  "darkColor": "#78d7b9",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Get Started",
+            "pages": [
+              "introduction",
+              "quickstart",
+              "installation"
+            ]
+          },
+          {
+            "group": "Core Concepts",
+            "pages": [
+              "concepts/architecture",
+              "concepts/data-models",
+              "concepts/storage-engine",
+              "concepts/query-engine"
+            ]
+          },
+          {
+            "group": "Data Ingestion",
+            "pages": [
+              "ingestion/overview",
+              "ingestion/stream-load",
+              "ingestion/routine-load",
+              "ingestion/broker-load"
+            ]
+          },
+          {
+            "group": "Querying Data",
+            "pages": [
+              "query/sql-overview",
+              "query/joins",
+              "query/materialized-views",
+              "query/query-optimization"
+            ]
+          },
+          {
+            "group": "Lakehouse & Integrations",
+            "pages": [
+              "lakehouse/overview",
+              "lakehouse/hive-iceberg-hudi",
+              "integrations/connectors",
+              "integrations/bi-tools"
+            ]
+          },
+          {
+            "group": "Operations",
+            "pages": [
+              "operations/cluster-management",
+              "operations/monitoring",
+              "operations/backup-restore",
+              "operations/security"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "MPP-based vectorized query engine for sub-second analytical queries",
+    "Columnar storage with multiple index types (BloomFilter, Inverted, Sort Key)",
+    "Three data models: Duplicate Key, Unique Key (primary key upserts), and Aggregate Key",
+    "Real-time data ingestion via Stream Load, Routine Load (Kafka), and Binlog CDC",
+    "Unified Lakehouse: federated queries across Hive, Iceberg, Hudi, Paimon, Delta Lake",
+    "Materialized views (single-table auto-refresh and multi-table async)",
+    "MySQL-compatible protocol supporting standard SQL and BI tool integration",
+    "Horizontally scalable FE/BE architecture with high availability and multi-replica storage",
+    "Pipeline execution engine leveraging multi-core CPUs with CBO/RBO/HBO query optimizer",
+    "Storage-compute separation mode (Cloud) for elastic scaling"
+  ],
+  "publicApiSurface": [
+    "MySQL Protocol (port 9030) — standard SQL interface",
+    "HTTP REST API (port 8030) — Stream Load, monitoring, schema queries",
+    "Arrow Flight SQL (port 8070) — high-throughput columnar data transfer",
+    "JDBC/ODBC connectivity",
+    "Stream Load API: PUT /api/{db}/{table}/_stream_load",
+    "Routine Load: CREATE ROUTINE LOAD ... FROM KAFKA",
+    "Broker Load: LOAD LABEL ... WITH BROKER",
+    "INSERT INTO ... SELECT / INSERT INTO ... VALUES",
+    "CREATE CATALOG for external data source federation",
+    "CREATE MATERIALIZED VIEW for pre-aggregated query acceleration",
+    "SHOW BACKENDS / SHOW FRONTENDS — cluster node management",
+    "Flink Doris Connector (CDC exactly-once sink)",
+    "Spark Doris Connector (batch read/write)",
+    "dbt-doris adapter"
+  ]
+}

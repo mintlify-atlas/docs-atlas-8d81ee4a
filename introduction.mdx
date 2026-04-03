@@ -1,0 +1,102 @@
+---
+title: "Apache Doris"
+description: "A high-performance, real-time MPP analytical database for sub-second queries at petabyte scale."
+---
+
+Apache Doris is an easy-to-use, high-performance analytical database based on MPP (Massively Parallel Processing) architecture. It delivers sub-second response times across massive datasets and supports both high-concurrency point queries and high-throughput complex analysis — all through standard SQL and a MySQL-compatible interface.
+
+<CardGroup cols={2}>
+  <Card title="Quick Start" icon="rocket" href="/quickstart">
+    Connect to Doris and run your first analytical query in minutes
+  </Card>
+  <Card title="Installation" icon="server" href="/installation">
+    Deploy a Doris cluster on bare metal, Docker, or Kubernetes
+  </Card>
+  <Card title="Core Concepts" icon="book" href="/concepts/architecture">
+    Understand the FE/BE architecture, data models, and query engine
+  </Card>
+  <Card title="Data Ingestion" icon="database" href="/ingestion/overview">
+    Load data via Stream Load, Routine Load, Broker Load, and more
+  </Card>
+</CardGroup>
+
+## Why Apache Doris?
+
+<CardGroup cols={3}>
+  <Card title="Extreme Performance" icon="bolt">
+    Vectorized query engine with SIMD optimization delivers 5–10x faster aggregations than non-vectorized engines
+  </Card>
+  <Card title="Unified Platform" icon="layer-group">
+    One system for real-time serving, interactive analytics, and offline batch processing
+  </Card>
+  <Card title="MySQL Compatible" icon="plug">
+    Connect using any MySQL client, JDBC driver, or BI tool — no proprietary client required
+  </Card>
+  <Card title="Lakehouse Ready" icon="warehouse">
+    Federated queries across Hive, Iceberg, Hudi, Paimon, and Delta Lake without data movement
+  </Card>
+  <Card title="Easy Operations" icon="gear">
+    Just two process types (FE and BE) with online scaling, automatic replica recovery, and no external dependencies
+  </Card>
+  <Card title="Real-Time Ingest" icon="clock">
+    Second-level data ingestion from Kafka, MySQL Binlog, and HTTP streams with exactly-once guarantees
+  </Card>
+</CardGroup>
+
+## Key Use Cases
+
+<AccordionGroup>
+  <Accordion title="Real-Time Reporting & Dashboards">
+    Build dashboards that reflect data ingested seconds ago. Doris's Unique Key model with Merge-on-Write delivers real-time upserts while maintaining sub-second query latency for BI tools like Superset, Tableau, and Power BI.
+  </Accordion>
+  <Accordion title="Ad Hoc Analysis at Scale">
+    Run exploratory SQL queries across billions of rows without pre-defining aggregations. The Nereids optimizer with CBO, RBO, and HBO automatically finds the best execution plan for complex multi-join queries.
+  </Accordion>
+  <Accordion title="Lakehouse Query Acceleration">
+    Accelerate slow Hive or Iceberg queries by up to 10x using Doris as a query layer over your existing data lake. Create external catalogs in seconds — no ETL required.
+  </Accordion>
+  <Accordion title="Log & Event Analytics">
+    Ingest and analyze high-volume log streams in real time using the Inverted Index for full-text search and the Duplicate Key model for raw event storage.
+  </Accordion>
+  <Accordion title="User Behavior & Funnel Analysis">
+    Analyze retention, conversion funnels, and cohort behavior with Doris's native BITMAP and HyperLogLog functions for fast approximate distinct counts.
+  </Accordion>
+</AccordionGroup>
+
+## Architecture Overview
+
+Apache Doris has a clean two-process architecture with no external dependencies:
+
+| Component | Role |
+|-----------|------|
+| **Frontend (FE)** | SQL parsing, query planning, metadata management, cluster coordination |
+| **Backend (BE)** | Data storage, query execution, compaction |
+
+FE nodes can be deployed as **Master**, **Follower**, or **Observer** roles for high availability. BE nodes store data in columnar format with multiple replicas, automatically recovering from node failures.
+
+<Note>
+  Apache Doris also supports a **storage-compute separated** (Cloud) architecture for elastic scaling, where compute and storage scale independently.
+</Note>
+
+## Explore the Documentation
+
+<CardGroup cols={2}>
+  <Card title="Data Models" icon="table" href="/concepts/data-models">
+    Choose between Duplicate Key, Unique Key, and Aggregate Key models
+  </Card>
+  <Card title="Stream Load" icon="arrow-up-from-bracket" href="/ingestion/stream-load">
+    Real-time HTTP-based data loading with sub-second latency
+  </Card>
+  <Card title="Materialized Views" icon="eye" href="/query/materialized-views">
+    Pre-compute aggregations for instant query acceleration
+  </Card>
+  <Card title="Lakehouse Catalogs" icon="folder-open" href="/lakehouse/overview">
+    Query Hive, Iceberg, Hudi, and more with CREATE CATALOG
+  </Card>
+  <Card title="Cluster Management" icon="network-wired" href="/operations/cluster-management">
+    Scale nodes, manage replicas, and monitor cluster health
+  </Card>
+  <Card title="Security" icon="shield" href="/operations/security">
+    Configure authentication, authorization, and data encryption
+  </Card>
+</CardGroup>

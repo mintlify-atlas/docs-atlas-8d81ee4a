@@ -1,0 +1,233 @@
+---
+title: 'Materialized views'
+description: 'Pre-compute aggregations with single-table and multi-table materialized views in Apache Doris.'
+keywords: ['materialized view', 'MTMV', 'async materialized view', 'sync materialized view', 'query rewrite', 'refresh']
+---
+
+Doris has two distinct materialized view systems. Choose based on whether you need single-table pre-aggregation or full multi-table join pre-computation.
+
+## Overview
+
+<CardGroup cols={2}>
+  <Card title="Synchronous MV" icon="bolt">
+    Single-table only. Refreshed automatically by the system on every write. Transparent to queries — the optimizer rewrites queries to use it without any application change. Supports aggregations and column projections.
+  </Card>
+  <Card title="Async MV (MTMV)" icon="clock">
+    Multi-table, including joins. Refreshed manually or on a schedule. Used for pre-computing complex reports, dashboards, and aggregated datasets. Backed by the `MTMV` catalog object in `org.apache.doris.catalog.MTMV`.
+  </Card>
+</CardGroup>
+
+## Synchronous materialized views
+
+Sync MVs are defined over a single base table. The system keeps them in sync automatically — every write to the base table triggers a corresponding write to the MV index. Queries that match the MV's aggregation pattern are transparently rewritten by the Nereids optimizer.
+
+### Create a sync MV
+
+```sql
+-- Pre-aggregate daily site stats from a raw events table
+CREATE MATERIALIZED VIEW mv_daily_site_stats
+AS
+SELECT
+    site_id,
+    stat_date,
+    SUM(pv)          AS total_pv,
+    HLL_UNION(uv)    AS uv
+FROM site_events
+GROUP BY site_id, stat_date;
+```
+
+The `CREATE MATERIALIZED VIEW` statement triggers an asynchronous build job. Monitor progress:
+
+```sql
+-- Check build status for all sync MVs in the current database
+SHOW ALTER TABLE MATERIALIZED VIEW FROM mydb;
+```
+
+Wait for the `State` column to show `FINISHED` before relying on the MV for query rewrites.
+
+### Transparent query rewrite
+
+Once built, the optimizer automatically rewrites matching queries to read from the pre-aggregated MV index instead of the base table:
+
+```sql
+-- This query is automatically rewritten to use mv_daily_site_stats
+SELECT site_id, SUM(pv) AS total_pv
+FROM site_events
+GROUP BY site_id;
+```
+
+No application change is needed. Use `EXPLAIN` to confirm a rewrite occurred — you'll see the MV name appear instead of the base table name in the scan node.
+
+### Drop a sync MV
+
+```sql
+DROP MATERIALIZED VIEW IF EXISTS mv_daily_site_stats ON site_events;
+```
+
+## Async materialized views (MTMV)
+
+Async MVs (Multi-Table Materialized Views) are full tables backed by the `MTMV` class. They support arbitrary SQL including multi-table joins, subqueries, and window functions. Refreshes are decoupled from writes — the MV holds a snapshot of data as of the last successful refresh.
+
+The `MTMV` object tracks: `refreshInfo` (schedule), `querySql` (the defining query), `status` (NORMAL / SCHEMA_CHANGE / etc.), and a `refreshSnapshot` to know which base table partitions are reflected in the current data.
+
+### Create an async MV
+
+```sql
+CREATE MATERIALIZED VIEW mv_order_summary
+BUILD DEFERRED REFRESH AUTO ON SCHEDULE EVERY 1 HOUR
+DISTRIBUTED BY HASH(order_date) BUCKETS 4
+PROPERTIES (
+    "replication_num" = "3"
+)
+AS
+SELECT
+    o.order_date,
+    c.region,
+    p.category,
+    SUM(oi.amount)      AS revenue,
+    COUNT(o.order_id)   AS order_count
+FROM orders o
+JOIN order_items oi ON o.order_id = oi.order_id AND o.user_id = oi.user_id
+JOIN customers   c  ON o.user_id  = c.user_id
+JOIN products    p  ON oi.product_id = p.product_id
+GROUP BY o.order_date, c.region, p.category;
+```
+
+Key clauses:
+
+| Clause | Description |
+|---|---|
+| `BUILD DEFERRED` | Do not build on creation; wait for first explicit or scheduled refresh |
+| `BUILD IMMEDIATE` | Build the MV immediately when the DDL runs |
+| `REFRESH AUTO ON SCHEDULE EVERY 1 HOUR` | Auto-detect changed partitions and refresh incrementally every hour |
+| `REFRESH COMPLETE ON SCHEDULE EVERY 1 DAY` | Full rebuild on schedule |
+| `REFRESH COMPLETE ON MANUAL` | Only refresh when you explicitly trigger it |
+| `DISTRIBUTED BY HASH(...)` | The MV is a physical OLAP table — must specify distribution |
+
+### Trigger a manual refresh
+
+```sql
+-- Refresh only the partitions that are out of date relative to base tables
+REFRESH MATERIALIZED VIEW mv_order_summary AUTO;
+
+-- Force a complete rebuild regardless of partition state
+REFRESH MATERIALIZED VIEW mv_order_summary COMPLETE;
+```
+
+### Check MV status
+
+```sql
+-- List all async MVs in the current database with status
+SHOW MATERIALIZED VIEW;
+
+-- Detailed info including refresh history and last refresh time
+SELECT Name, State, RefreshState, SyncWithBaseTables, LastRefreshTime
+FROM mv_infos('database'='mydb')
+WHERE Name = 'mv_order_summary';
+```
+
+The `State` field corresponds to `MTMVState` in the source:
+
+| State | Meaning |
+|---|---|
+| `NORMAL` | MV is healthy and valid for query rewrite |
+| `SCHEMA_CHANGE` | A base table schema change made the MV stale; refresh or recreate |
+| `INIT` | MV was just created and has not been refreshed yet |
+
+### MV properties
+
+Control behavior via `PROPERTIES`:
+
+```sql
+-- Grace period: allow rewrite even if MV is up to N seconds stale
+PROPERTIES ("grace_period" = "3600")
+
+-- Pin to a workload group for refresh jobs
+PROPERTIES ("workload_group" = "etl_group")
+
+-- How many partitions to refresh per task (default: all)
+PROPERTIES ("refresh_partition_num" = "5")
+
+-- Disable this MV for transparent rewrite (keep data but stop rewrites)
+PROPERTIES ("use_for_rewrite" = "false")
+```
+
+## Transparent query rewrite
+
+The Nereids optimizer (via rules in `rules/exploration/mv/`) automatically rewrites queries to use MVs when the MV's query subsumes the user query. This works for both sync and async MVs.
+
+```sql
+-- Enable transparent rewrite (on by default in Doris)
+SET enable_materialized_view_rewrite = true;
+
+-- This query will transparently use mv_order_summary when applicable
+SELECT
+    o.order_date,
+    c.region,
+    SUM(oi.amount) AS revenue
+FROM orders o
+JOIN order_items oi ON o.order_id = oi.order_id AND o.user_id = oi.user_id
+JOIN customers   c  ON o.user_id  = c.user_id
+GROUP BY o.order_date, c.region;
+```
+
+Use `EXPLAIN VERBOSE` to see the `MATERIALIZATIONS` section at the bottom of the plan, which lists which MVs were considered and whether any were chosen:
+
+```sql
+EXPLAIN VERBOSE SELECT o.order_date, c.region, SUM(oi.amount) ...;
+```
+
+<Tip>
+For async MVs, the optimizer respects `grace_period`. If the MV is stale by more than the grace period, it will not be used for rewrite, and the query falls back to scanning the base tables. Set `grace_period` based on how much staleness your queries can tolerate.
+</Tip>
+
+### Rewrite consistency for async MVs
+
+By default, an async MV is only eligible for rewrite when it is fully in sync with all base table partitions (`SyncWithBaseTables = true`). You can relax this per table:
+
+```sql
+-- Allow rewrite even when the 'products' dimension table is stale
+ALTER MATERIALIZED VIEW mv_order_summary
+SET PROPERTIES ("query_rewrite_consistency_relaxed_tables" = "products");
+```
+
+## Supported aggregate functions in MVs
+
+The following aggregate functions can be pre-computed in both sync and async MVs:
+
+| Function | Notes |
+|---|---|
+| `SUM(col)` | Basic sum |
+| `COUNT(col)`, `COUNT(*)` | Row count |
+| `MAX(col)`, `MIN(col)` | Extremes |
+| `HLL_UNION(hll_col)` | Merge HLL sketches for approximate distinct count |
+| `BITMAP_UNION(bitmap_col)` | Merge bitmaps for exact distinct count |
+| `NDV(col)` / `APPROX_COUNT_DISTINCT(col)` | Approximate distinct count (HyperLogLog internally) |
+
+<Note>
+For sync MVs, the aggregate function in the MV definition must exactly match what the query uses. For example, a sync MV with `SUM(amount)` can answer `SUM(amount)` queries but not `COUNT(DISTINCT user_id)` queries — create a separate MV with `BITMAP_UNION(TO_BITMAP(user_id))` for the latter.
+</Note>
+
+## Managing async MVs
+
+```sql
+-- Drop an async MV
+DROP MATERIALIZED VIEW IF EXISTS mv_order_summary;
+
+-- Change the refresh schedule
+ALTER MATERIALIZED VIEW mv_order_summary
+REFRESH AUTO ON SCHEDULE EVERY 6 HOUR;
+
+-- Pause automatic refreshes (manual trigger still works)
+ALTER MATERIALIZED VIEW mv_order_summary SUSPEND;
+
+-- Resume automatic refreshes
+ALTER MATERIALIZED VIEW mv_order_summary RESUME;
+
+-- Rename an MV
+ALTER MATERIALIZED VIEW mv_order_summary RENAME mv_order_summary_v2;
+
+-- Show all refresh task history
+SELECT * FROM tasks('type'='mv') WHERE MvName = 'mv_order_summary'
+ORDER BY CreateTime DESC LIMIT 20;
+```

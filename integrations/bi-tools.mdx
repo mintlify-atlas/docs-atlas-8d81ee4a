@@ -1,0 +1,241 @@
+---
+title: "BI tools"
+description: "Connect Apache Doris to Tableau, Power BI, Apache Superset, and other BI tools via MySQL protocol."
+keywords: ["bi", "tableau", "power bi", "superset", "grafana", "metabase", "mysql protocol", "arrow flight sql"]
+---
+
+## Overview
+
+Doris exposes a **MySQL-compatible protocol on port 9030**. Any BI tool, SQL client, or analytics platform that supports MySQL can connect to Doris without additional drivers or middleware. Doris parses and executes the queries natively using its MPP engine.
+
+## Supported tools
+
+<CardGroup cols={3}>
+  <Card title="Apache Superset" icon="chart-bar">
+    Open-source BI platform. Connects via `mysql+pymysql` SQLAlchemy dialect.
+  </Card>
+  <Card title="Tableau" icon="table">
+    Use the built-in MySQL connector. Supports live and extract modes.
+  </Card>
+  <Card title="Power BI" icon="microsoft">
+    Use the MySQL connector in Power BI Desktop or Power BI Service (via gateway).
+  </Card>
+  <Card title="Grafana" icon="activity">
+    Use the MySQL data source plugin for time-series dashboards.
+  </Card>
+  <Card title="Metabase" icon="database">
+    Add Doris as a MySQL database in Metabase settings.
+  </Card>
+  <Card title="FineBI" icon="bar-chart">
+    Add a MySQL data connection pointing to the Doris FE node.
+  </Card>
+  <Card title="Redash" icon="search">
+    Create a MySQL data source. Full SQL query support.
+  </Card>
+</CardGroup>
+
+## Connection details
+
+| Field | Value |
+|---|---|
+| Protocol | MySQL |
+| Host | Doris FE hostname or IP |
+| Port | `9030` |
+| Database | Target database name |
+| Username | Doris user (default: `root`) |
+| Password | Doris user password |
+
+## Tool-specific setup
+
+<Tabs>
+  <Tab title="Apache Superset">
+
+<Steps>
+  <Step title="Install the pymysql driver">
+
+Superset connects to Doris using the `mysql+pymysql` SQLAlchemy dialect. If `pymysql` is not already installed in your Superset environment:
+
+```bash
+pip install pymysql
+```
+
+  </Step>
+  <Step title="Add a database connection">
+
+In Superset, go to **Settings → Database Connections → + Database**.
+
+Select **MySQL** as the database type, then enter the connection URI:
+
+```
+mysql+pymysql://root:@doris-fe-host:9030/mydb
+```
+
+Replace `root`, `doris-fe-host`, and `mydb` with your credentials and target database.
+
+  </Step>
+  <Step title="Test and connect">
+
+Click **Test Connection**. A green success message confirms connectivity. Click **Connect** to save.
+
+  </Step>
+  <Step title="Create datasets and charts">
+
+After connecting, go to **Datasets → + Dataset**, select your Doris database and schema, and pick a table. From there you can build charts and dashboards using the Superset chart builder or SQL Lab.
+
+  </Step>
+</Steps>
+
+<Tip>
+Use Superset's SQL Lab to run ad-hoc queries against Doris directly. Doris supports window functions, lateral views, and most standard SQL analytic syntax that Superset generates.
+</Tip>
+
+  </Tab>
+  <Tab title="Tableau">
+
+<Steps>
+  <Step title="Open Tableau Desktop">
+
+On the start page, under **Connect → To a Server**, click **MySQL**.
+
+  </Step>
+  <Step title="Enter connection details">
+
+| Field | Value |
+|---|---|
+| Server | `doris-fe-host` |
+| Port | `9030` |
+| Database | Your database name |
+| Username | Doris username |
+| Password | Doris password |
+
+Click **Sign In**.
+
+  </Step>
+  <Step title="Select tables">
+
+In the Data Source pane, select your schema and drag tables to the canvas. Tableau generates SQL that Doris executes via the MySQL protocol.
+
+  </Step>
+</Steps>
+
+<Note>
+Tableau sends `SHOW DATABASES`, `SHOW TABLES`, and `DESCRIBE` statements during connection setup. Doris implements all of these for MySQL protocol compatibility.
+</Note>
+
+**Live vs. extract:** Use **Live** connection to query Doris in real time. Use **Extract** to pull a snapshot into Tableau's `.hyper` format for offline analysis. For dashboards with heavy aggregations, Live with Doris MPP is usually faster than an Extract refresh.
+
+  </Tab>
+  <Tab title="Power BI">
+
+<Steps>
+  <Step title="Install the MySQL ODBC driver">
+
+Power BI Desktop uses the MySQL ODBC driver to communicate over the MySQL protocol. Download and install the [MySQL Connector/ODBC](https://dev.mysql.com/downloads/connector/odbc/) that matches your Windows architecture (64-bit recommended).
+
+  </Step>
+  <Step title="Get data from MySQL">
+
+In Power BI Desktop, click **Home → Get Data → MySQL database**.
+
+| Field | Value |
+|---|---|
+| Server | `doris-fe-host:9030` |
+| Database | Your database name (optional) |
+
+Click **OK**, then enter your Doris username and password when prompted.
+
+  </Step>
+  <Step title="Load or transform">
+
+In the Navigator, expand the database and select tables. Click **Load** for direct import, or **Transform Data** to open Power Query for data shaping before loading.
+
+  </Step>
+</Steps>
+
+<Note>
+Power BI Service (cloud) requires an on-premises data gateway to reach a self-hosted Doris cluster. The gateway proxies MySQL protocol traffic from Power BI Service to your Doris FE node.
+</Note>
+
+  </Tab>
+  <Tab title="Grafana">
+
+<Steps>
+  <Step title="Add a MySQL data source">
+
+In Grafana, go to **Connections → Data sources → Add data source** and select **MySQL**.
+
+| Field | Value |
+|---|---|
+| Host URL | `doris-fe-host:9030` |
+| Database name | Your database |
+| Username | Doris username |
+| Password | Doris password |
+
+Click **Save & test**.
+
+  </Step>
+  <Step title="Create a dashboard panel">
+
+Add a new panel and switch to the **Code** editor to write SQL. Grafana provides macros for time filtering and grouping that Doris evaluates as standard SQL:
+
+```sql
+SELECT
+    $__timeGroup(event_time, $__interval) AS time,
+    COUNT(*)                              AS events
+FROM events
+WHERE $__timeFilter(event_time)
+GROUP BY 1
+ORDER BY 1
+```
+
+`$__timeGroup` maps to a `DATE_FORMAT` or `UNIX_TIMESTAMP` expression. `$__timeFilter` injects a `BETWEEN` predicate using the dashboard's time range.
+
+  </Step>
+</Steps>
+
+<Tip>
+For high-cardinality metrics tables, create a Doris Aggregate Key table with a `DATETIME` column as the first key column and the metrics as `SUM` or `MAX` aggregate columns. This lets Doris pre-aggregate data at ingest time and return Grafana queries in milliseconds.
+</Tip>
+
+  </Tab>
+</Tabs>
+
+## Arrow Flight SQL for high-throughput reads
+
+For workloads that transfer large result sets — such as BI tools that pull raw data for local processing, or notebook environments running exploratory analysis — Doris supports **Apache Arrow Flight SQL**, which streams results in the columnar Arrow format over gRPC.
+
+**Ports:**
+
+| Component | Port |
+|---|---|
+| FE Arrow Flight SQL | `8070` |
+| BE Arrow Flight SQL | `8050` |
+
+**Benefits over MySQL protocol:**
+
+- 5–10x faster bulk reads due to columnar serialization and zero-copy Arrow buffers
+- Eliminates MySQL text protocol encoding overhead for numeric and binary types
+- Supported by DBeaver (via Arrow Flight SQL plugin), ADBC, and custom analytics pipelines
+
+**ADBC Python example:**
+
+```python
+import adbc_driver_flightsql.dbapi as flight_sql
+
+conn = flight_sql.connect(
+    uri="grpc://doris-fe-host:8070",
+    db_kwargs={
+        "username": "root",
+        "password": "",
+    }
+)
+
+cursor = conn.cursor()
+cursor.execute("SELECT order_id, amount FROM mydb.orders LIMIT 100000")
+table = cursor.fetch_arrow_table()
+print(table.schema)
+```
+
+<Note>
+Arrow Flight SQL support must be enabled on the FE node. Set `arrow_flight_sql_port = 8070` in `fe.conf` and ensure the corresponding port is open in your network security rules.
+</Note>

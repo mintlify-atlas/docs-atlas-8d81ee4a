@@ -1,0 +1,123 @@
+---
+title: "Lakehouse overview"
+description: "Query data lakes and external databases directly using Apache Doris catalogs without data movement."
+keywords: ["lakehouse", "catalog", "hive", "iceberg", "hudi", "paimon", "jdbc", "data federation"]
+---
+
+## What is a Doris catalog?
+
+A **catalog** in Apache Doris is a logical namespace that groups one or more databases and tables. Doris ships with two catalog tiers:
+
+- **Internal Catalog** (`internal`) — the built-in catalog that holds all Doris-native OLAP tables. It is always present and cannot be dropped.
+- **External Catalogs** — user-created catalogs that map to external data sources such as Hive Metastore, Apache Iceberg, Apache Paimon, JDBC databases, and Elasticsearch. Doris reads metadata and data directly from the remote system; no ETL or data copy is required.
+
+The catalog system routes each `CREATE CATALOG` statement to the corresponding catalog implementation based on the `type` property.
+
+## Supported external sources
+
+| Source | Catalog type | Description |
+|---|---|---|
+| Apache Hive | `hms` | Query Hive tables via Hive Metastore (HMS) |
+| Apache Iceberg | `iceberg` | REST, HMS, Glue, Hadoop, or S3 Tables catalog backend |
+| Apache Hudi | `hms` | Hudi CoW and MoR tables discovered automatically via HMS |
+| Apache Paimon | `paimon` | Native Paimon catalog; filesystem, HMS, REST, or JDBC backend |
+| Delta Lake | `hms` | Delta Lake tables accessed via HMS |
+| MySQL | `jdbc` | Direct query federation over MySQL JDBC driver |
+| PostgreSQL | `jdbc` | Direct query federation over PostgreSQL JDBC driver |
+| Elasticsearch | `es` | Full-text search and document federation |
+| S3 Tables / Files | `iceberg` | Directly query files on S3 via the `s3tables` catalog type |
+
+<Tip>
+Parquet and ORC are the recommended file formats for best scan performance. Columnar formats allow Doris to push down column pruning and predicate filters to the storage layer.
+</Tip>
+
+## Creating and using catalogs
+
+Use `CREATE CATALOG` with a `PROPERTIES` map to register an external source. The only required key is `"type"`.
+
+```sql
+-- Create a Hive Metastore catalog
+CREATE CATALOG hive_catalog PROPERTIES (
+    "type" = "hms",
+    "hive.metastore.uris" = "thrift://hive-metastore:9083"
+);
+
+-- Switch to the catalog and query
+SWITCH hive_catalog;
+USE mydb;
+SELECT * FROM events LIMIT 10;
+
+-- Or use the three-part identifier without switching catalogs
+SELECT * FROM hive_catalog.mydb.events LIMIT 10;
+```
+
+<Note>
+`SWITCH` changes the session-level active catalog. You can always use the three-part `catalog.database.table` name to reference any table regardless of the active catalog.
+</Note>
+
+## Cross-catalog queries
+
+Doris can JOIN tables across the internal catalog and any number of external catalogs in a single query. There is no requirement to import data first.
+
+```sql
+SELECT d.user_id, d.name, h.purchase_count
+FROM internal.crm.customers AS d
+JOIN hive_catalog.analytics.user_purchases AS h
+    ON d.user_id = h.user_id
+WHERE h.dt = '2024-01-01';
+```
+
+Cross-catalog queries go through the same Nereids optimizer pipeline as internal queries. Partition pruning, predicate pushdown, and runtime filters apply to external tables wherever the underlying format supports them.
+
+## Catalog management
+
+```sql
+-- List all registered catalogs
+SHOW CATALOGS;
+
+-- Inspect the DDL for an existing catalog
+SHOW CREATE CATALOG hive_catalog;
+
+-- Update catalog properties without dropping and recreating
+ALTER CATALOG hive_catalog SET PROPERTIES (
+    "hive.metastore.uris" = "thrift://new-hms-host:9083"
+);
+
+-- Remove a catalog (does not delete remote data)
+DROP CATALOG hive_catalog;
+```
+
+<Warning>
+`DROP CATALOG` only removes the Doris catalog registration. It does not delete any data in the external system.
+</Warning>
+
+## Metadata caching
+
+External catalog metadata (database lists, table schemas, partition lists) is cached in Doris FE to avoid hitting the remote metastore on every query. You can manually invalidate the cache at any level:
+
+```sql
+-- Refresh all metadata for a catalog
+REFRESH CATALOG hive_catalog;
+
+-- Refresh a specific database
+REFRESH DATABASE hive_catalog.mydb;
+
+-- Refresh a specific table
+REFRESH TABLE hive_catalog.mydb.events;
+```
+
+Cache TTL is configurable per catalog. For HMS-based catalogs, use the `file.meta.cache.ttl-second` and `partition.cache.ttl-second` properties.
+
+## File format support
+
+| Format | Read | Write | Notes |
+|---|---|---|---|
+| Parquet | Yes | Yes (Iceberg) | Recommended; supports column pruning and predicate pushdown |
+| ORC | Yes | No | Recommended for Hive workloads |
+| CSV / TSV | Yes | No | No column pruning |
+| JSON | Yes | No | Row-oriented; no predicate pushdown |
+| Avro | Yes | No | Schema evolution supported |
+
+<Tip>
+Use Parquet with Snappy or Zstd compression for the best balance of scan speed and storage efficiency.
+</Tip>

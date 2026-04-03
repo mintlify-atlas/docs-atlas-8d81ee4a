@@ -1,0 +1,247 @@
+---
+title: 'Stream Load'
+description: 'Load data in real time using HTTP PUT requests to Apache Doris.'
+keywords: ['stream load', 'http put', 'real-time ingestion', 'csv', 'json', 'two-phase commit', '2pc']
+---
+
+Stream Load is a synchronous HTTP API that ingests data directly into a Doris table via a single `PUT` request. The response is returned only after the load has either committed or failed — there is no polling step. It is the recommended method for application-driven ingestion and for Flink connectors.
+
+**Supported formats:** CSV, JSON, Parquet, ORC
+
+The FE receives the request, authenticates it, selects a Backend node using a round-robin policy (see `LoadAction.java:416`), and redirects the raw data stream to that BE. The BE executes the load plan and commits the transaction before returning a result to the client.
+
+## Basic usage
+
+Send a CSV file to a table using `curl`:
+
+```bash
+curl -u root: \
+  -H "label:load_$(date +%s)" \
+  -H "column_separator:," \
+  -H "columns: col1, col2, col3" \
+  -T /path/to/data.csv \
+  http://fe_host:8030/api/mydb/mytable/_stream_load
+```
+
+<Note>
+The `Expect: 100-continue` header is required by Doris and is sent automatically by `curl -T`. If you use a custom HTTP client, add this header explicitly or the FE will reject the request.
+</Note>
+
+The endpoint pattern is:
+
+```
+PUT http://<fe_host>:8030/api/<database>/<table>/_stream_load
+```
+
+Authentication uses HTTP Basic Auth. The FE validates `LOAD` privilege on the target table before redirecting.
+
+## HTTP headers reference
+
+<ParamField header="label" type="string">
+  Unique label for this load job within the database. Used for idempotency — submitting the same label twice returns the result of the first successful load. If omitted, Doris generates a UUID automatically. Recommended format: `job_name_$(date +%s)`.
+</ParamField>
+
+<ParamField header="column_separator" type="string" default="\t">
+  Field delimiter for CSV data. Common values: `,` for comma-separated, `\t` for tab-separated. Supports multi-character separators and hex escapes such as `\x01`.
+</ParamField>
+
+<ParamField header="columns" type="string">
+  Comma-separated list of column names that maps input fields to table columns. Supports transformation expressions: `columns: id, name, ts, dt=from_unixtime(ts)`. Columns not listed are set to their default values.
+</ParamField>
+
+<ParamField header="where" type="string">
+  SQL filter expression. Only rows matching the condition are loaded. Example: `where: status != 'deleted'`.
+</ParamField>
+
+<ParamField header="max_filter_ratio" type="number" default="0">
+  Maximum acceptable ratio of filtered (rejected) rows, between `0` and `1`. A load fails immediately if the actual error ratio exceeds this value. Set to `0.1` to tolerate up to 10% bad rows.
+</ParamField>
+
+<ParamField header="timeout" type="number" default="600">
+  Load timeout in seconds. If the load does not complete within this time, it is cancelled and the transaction is aborted.
+</ParamField>
+
+<ParamField header="format" type="string" default="csv">
+  Input data format. Valid values: `csv`, `json`, `parquet`, `orc`. For Parquet and ORC, column mapping is inferred from the file schema automatically unless `columns` is specified.
+</ParamField>
+
+<ParamField header="strip_outer_array" type="boolean" default="false">
+  For JSON format: when `true`, expects the input to be a top-level JSON array and treats each element as a separate row. Required when sending `[{...}, {...}]` style payloads.
+</ParamField>
+
+<ParamField header="jsonpaths" type="string">
+  JSON path expressions for extracting fields from complex JSON structures. Must be a JSON array of path strings. Example: `["$.order_id", "$.customer.name", "$.items[0].price"]`.
+</ParamField>
+
+<ParamField header="two_phase_commit" type="boolean" default="false">
+  When `true`, pre-commits the transaction without making data visible. Use with the `/_stream_load_2pc` endpoint to commit or abort later. See [Two-phase commit](#two-phase-commit-2pc) below.
+</ParamField>
+
+## Loading JSON data
+
+```bash
+curl -u root: \
+  -H "label:json_load_001" \
+  -H "format:json" \
+  -H "strip_outer_array:true" \
+  -T /path/to/data.json \
+  http://fe_host:8030/api/mydb/mytable/_stream_load
+```
+
+For nested JSON, add `jsonpaths` to extract specific fields:
+
+```bash
+curl -u root: \
+  -H "label:json_nested_001" \
+  -H "format:json" \
+  -H "strip_outer_array:true" \
+  -H 'jsonpaths:["$.order_id","$.customer.name","$.total_amount"]' \
+  -H "columns: order_id, customer_name, total_amount" \
+  -T /path/to/orders.json \
+  http://fe_host:8030/api/mydb/mytable/_stream_load
+```
+
+## Response format
+
+A successful load returns HTTP 200 with a JSON body:
+
+```json
+{
+    "TxnId": 14017,
+    "Label": "json_load_001",
+    "TwoPhaseCommit": "false",
+    "Status": "Success",
+    "Message": "OK",
+    "NumberTotalRows": 10000,
+    "NumberLoadedRows": 9987,
+    "NumberFilteredRows": 13,
+    "NumberUnselectedRows": 0,
+    "LoadBytes": 2097152,
+    "LoadTimeMs": 312,
+    "BeginTxnTimeMs": 2,
+    "StreamLoadPutTimeMs": 45,
+    "ReadDataTimeMs": 88,
+    "WriteDataTimeMs": 160,
+    "CommitAndPublishTimeMs": 17,
+    "ErrorURL": "http://be_host:8040/api/_load_error_log?file=__shard_1/error_log_1234"
+}
+```
+
+| Field | Description |
+|-------|-------------|
+| `TxnId` | Internal transaction ID. Required for 2PC commit/abort. |
+| `Status` | `Success`, `Publish Timeout`, `Label Already Exists`, or `Fail`. |
+| `Message` | Human-readable status detail. |
+| `NumberTotalRows` | Total rows in the input. |
+| `NumberLoadedRows` | Rows successfully written. |
+| `NumberFilteredRows` | Rows rejected due to data quality errors. |
+| `NumberUnselectedRows` | Rows filtered by the `where` clause. |
+| `LoadBytes` | Raw bytes read from the input stream. |
+| `LoadTimeMs` | Total end-to-end load time in milliseconds. |
+| `ErrorURL` | URL to fetch a sample of rejected rows. Only present when `NumberFilteredRows > 0`. |
+
+## Two-phase commit (2PC)
+
+2PC allows you to separate data ingestion from transaction visibility, enabling exactly-once semantics with external systems.
+
+<Steps>
+  <Step title="Pre-commit the load">
+    Add `two_phase_commit: true` to your load request. Doris writes the data and holds the transaction open, then returns the `TxnId` in the response.
+
+    ```bash
+    curl -u root: \
+      -H "label:flink_checkpoint_42" \
+      -H "format:json" \
+      -H "strip_outer_array:true" \
+      -H "two_phase_commit:true" \
+      -T /path/to/batch.json \
+      http://fe_host:8030/api/mydb/mytable/_stream_load
+    ```
+
+    The response includes `"TwoPhaseCommit": "true"` and a `TxnId`.
+  </Step>
+
+  <Step title="Commit or abort the transaction">
+    Once your upstream system confirms durability (for example, a Flink checkpoint succeeds), commit using the `TxnId`:
+
+    ```bash
+    # Commit
+    curl -u root: \
+      -H "txn_id:14017" \
+      -H "txn_operation:commit" \
+      -X PUT \
+      http://fe_host:8030/api/mydb/_stream_load_2pc
+
+    # Abort (rollback)
+    curl -u root: \
+      -H "txn_id:14017" \
+      -H "txn_operation:abort" \
+      -X PUT \
+      http://fe_host:8030/api/mydb/_stream_load_2pc
+    ```
+
+    You may also identify the transaction by label instead of `txn_id`:
+
+    ```bash
+    curl -u root: \
+      -H "label:flink_checkpoint_42" \
+      -H "txn_operation:commit" \
+      -X PUT \
+      http://fe_host:8030/api/mydb/_stream_load_2pc
+    ```
+  </Step>
+</Steps>
+
+<Warning>
+Pre-committed transactions hold resources on the BE until they are committed or aborted. Always abort a pre-committed transaction when the upstream checkpoint fails. Uncommitted transactions are automatically aborted after the load `timeout` elapses.
+</Warning>
+
+## Error handling
+
+When `NumberFilteredRows > 0`, the response includes an `ErrorURL`. Fetch it to inspect up to 1000 sample rejected rows:
+
+```bash
+curl "http://be_host:8040/api/_load_error_log?file=__shard_1/error_log_1234"
+```
+
+Common causes of filtered rows:
+
+- Type mismatch (for example, a string in an integer column when `strict_mode` is enabled)
+- Column count mismatch between input and the `columns` mapping
+- Constraint violations in strict mode
+
+To allow a higher error rate during development or for noisy data sources, increase `max_filter_ratio`:
+
+```bash
+curl -u root: \
+  -H "label:load_tolerant_001" \
+  -H "column_separator:," \
+  -H "max_filter_ratio:0.05" \
+  -T /path/to/data.csv \
+  http://fe_host:8030/api/mydb/mytable/_stream_load
+```
+
+<Tip>
+Set `max_filter_ratio` to `0` in production to fail fast on bad data, and use a non-zero value only during initial schema validation or when ingesting data from sources with known quality issues.
+</Tip>
+
+## Group Commit
+
+Group Commit batches many small Stream Load requests into a single transaction automatically, dramatically reducing per-write overhead. It is transparent to the client — only the `group_commit` header needs to be added.
+
+```bash
+curl -u root: \
+  -H "label:micro_batch_$(date +%s%N)" \
+  -H "column_separator:," \
+  -H "group_commit:async_mode" \
+  -T /path/to/small_batch.csv \
+  http://fe_host:8030/api/mydb/mytable/_stream_load
+```
+
+Valid values for `group_commit`:
+
+| Value | Behaviour |
+|-------|-----------|
+| `async_mode` | Returns after the data is written to a WAL. The batch is committed in the background. Lowest latency. |
+| `sync_mode` | Returns only after the combined transaction is committed and visible. Higher latency, stronger consistency. |
+| `off_mode` | Disables group commit for this request, even if enabled globally. |

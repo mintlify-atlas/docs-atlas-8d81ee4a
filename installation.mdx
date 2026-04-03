@@ -1,0 +1,401 @@
+---
+title: 'Installation'
+description: Deploy Apache Doris on bare metal, Docker, or Kubernetes.
+---
+
+Apache Doris consists of two process types: **Frontend (FE)** for metadata management and query planning, and **Backend (BE)** for storage and query execution. Choose the deployment method that fits your environment.
+
+<Tabs>
+
+<Tab title="Docker (recommended for dev)">
+
+Docker is the fastest way to get a working Doris cluster for development and evaluation. The official Apache Doris images handle process startup and BE registration automatically via environment variables.
+
+### Single-node with docker-compose
+
+Create a `docker-compose.yml` file with one FE and one BE:
+
+```yaml
+version: '3'
+services:
+  doris-fe:
+    image: apache/doris:2.0.0-fe-x86_64
+    container_name: doris-fe
+    hostname: fe
+    environment:
+      - FE_SERVERS=fe1:172.20.80.2:9010
+      - FE_ID=1
+    ports:
+      - "8030:8030"   # HTTP API / web UI
+      - "9030:9030"   # MySQL query port
+    volumes:
+      - doris-fe-meta:/opt/apache-doris/fe/doris-meta
+      - doris-fe-log:/opt/apache-doris/fe/log
+    networks:
+      doris_net:
+        ipv4_address: 172.20.80.2
+
+  doris-be:
+    image: apache/doris:2.0.0-be-x86_64
+    container_name: doris-be
+    hostname: be
+    depends_on:
+      - doris-fe
+    environment:
+      - FE_SERVERS=fe1:172.20.80.2:9010
+      - BE_ADDR=172.20.80.3:9050
+    ports:
+      - "8040:8040"   # BE HTTP port
+    volumes:
+      - doris-be-storage:/opt/apache-doris/be/storage
+      - doris-be-log:/opt/apache-doris/be/log
+    networks:
+      doris_net:
+        ipv4_address: 172.20.80.3
+
+volumes:
+  doris-fe-meta:
+  doris-fe-log:
+  doris-be-storage:
+  doris-be-log:
+
+networks:
+  doris_net:
+    ipam:
+      config:
+        - subnet: 172.20.80.0/24
+```
+
+Start the cluster:
+
+```bash
+docker compose up -d
+```
+
+Wait about 30 seconds for both services to initialize, then connect:
+
+```bash
+mysql -h 127.0.0.1 -P 9030 -uroot
+```
+
+Verify the BE registered and is healthy:
+
+```sql
+SHOW BACKENDS\G
+```
+
+<Note>
+  For a single-node Docker deployment, set `"replication_num" = "1"` on all tables. The default of 3 replicas requires at least 3 BE nodes.
+</Note>
+
+<Tip>
+  The FE web UI is available at `http://127.0.0.1:8030`. Log in with username `root` and an empty password.
+</Tip>
+
+### Run with docker run
+
+If you prefer individual containers without Compose:
+
+```bash
+# Start FE
+docker run -d \
+  --name doris-fe \
+  -p 8030:8030 \
+  -p 9030:9030 \
+  -e FE_SERVERS="fe1:127.0.0.1:9010" \
+  -e FE_ID=1 \
+  apache/doris:2.0.0-fe-x86_64
+
+# Start BE (after FE is healthy)
+docker run -d \
+  --name doris-be \
+  -p 8040:8040 \
+  --link doris-fe \
+  -e FE_SERVERS="fe1:doris-fe:9010" \
+  -e BE_ADDR="$(hostname -I | awk '{print $1}'):9050" \
+  apache/doris:2.0.0-be-x86_64
+```
+
+</Tab>
+
+<Tab title="Binary (production)">
+
+Installing from the binary tarball gives you full control over configuration, networking, and resource allocation. This is the recommended approach for production deployments.
+
+### Step 1: System requirements
+
+Before installing, verify and configure the following:
+
+```bash
+# JDK 17 is required for both FE and BE
+java -version
+
+# Set vm.max_map_count for BE (must be >= 2000000)
+sudo sysctl -w vm.max_map_count=2000000
+echo "vm.max_map_count=2000000" | sudo tee -a /etc/sysctl.conf
+
+# Set open file descriptor limits for BE (must be >= 60000)
+ulimit -n 655350
+# Make permanent in /etc/security/limits.conf:
+# * soft nofile 655350
+# * hard nofile 655350
+
+# Disable swap (required for BE)
+sudo swapoff -a
+```
+
+### Step 2: Download and extract
+
+Download the binary release from [doris.apache.org/download](https://doris.apache.org/download):
+
+```bash
+wget https://apache-doris-releases.oss-accelerate.aliyuncs.com/apache-doris-2.1.0-bin-x64.tar.gz
+tar -xzf apache-doris-2.1.0-bin-x64.tar.gz
+cd apache-doris-2.1.0-bin-x64
+```
+
+### Step 3: Configure FE
+
+Edit `fe/conf/fe.conf`. The key ports are:
+
+```ini
+# fe/conf/fe.conf
+
+http_port      = 8030   # HTTP API and web UI
+query_port     = 9030   # MySQL protocol query port
+rpc_port       = 9020   # Internal Thrift RPC
+edit_log_port  = 9010   # BDB edit log (Follower/Observer communication)
+```
+
+<Note>
+  On servers with multiple network interfaces, set `priority_networks` to the CIDR of the interface Doris should bind to. Without this setting, FE and BE may bind to different IPs and fail to communicate.
+
+  ```ini
+  # Example: bind to the 10.0.1.x network
+  priority_networks = 10.0.1.0/24
+  ```
+
+  Both `fe.conf` and `be.conf` must have the same `priority_networks` value.
+</Note>
+
+### Step 4: Configure BE
+
+Edit `be/conf/be.conf`. The key ports are:
+
+```ini
+# be/conf/be.conf
+
+be_port                = 9060   # Internal BE thrift server
+webserver_port         = 8040   # BE HTTP port (metrics, API)
+heartbeat_service_port = 9050   # Heartbeat port (FE uses this to register BE)
+brpc_port              = 8060   # BRPC communication between BE nodes
+```
+
+Set the storage directory:
+
+```ini
+# be/conf/be.conf
+storage_root_path = /data/doris/storage
+```
+
+Create the storage directory before starting:
+
+```bash
+mkdir -p /data/doris/storage
+```
+
+### Step 5: Start FE
+
+```bash
+# Create the metadata directory
+mkdir -p fe/doris-meta
+
+# Start FE in daemon mode
+bin/start_fe.sh --daemon
+```
+
+Wait for FE to become available:
+
+```bash
+curl http://127.0.0.1:8030/api/bootstrap
+# Expected: {"status":"OK","msg":"success"}
+```
+
+### Step 6: Start BE
+
+```bash
+bin/start_be.sh --daemon
+```
+
+Verify BE is healthy:
+
+```bash
+curl http://127.0.0.1:8040/api/health
+```
+
+### Step 7: Register BE with FE
+
+Connect to FE using the MySQL client and add the BE:
+
+```bash
+mysql -h 127.0.0.1 -P 9030 -uroot
+```
+
+```sql
+-- Register the BE node (use the BE host IP and heartbeat_service_port)
+ALTER SYSTEM ADD BACKEND "127.0.0.1:9050";
+
+-- Confirm it is alive
+SHOW BACKENDS\G
+```
+
+### Stopping the cluster
+
+```bash
+bin/stop_fe.sh
+bin/stop_be.sh
+```
+
+### Adding FE Follower nodes
+
+To add a second FE as a Follower for high availability:
+
+```sql
+ALTER SYSTEM ADD FOLLOWER "fe2-host:9010";
+```
+
+Then start FE on the second node with the `--helper` flag pointing to the Master:
+
+```bash
+bin/start_fe.sh --helper fe1-host:9010 --daemon
+```
+
+</Tab>
+
+<Tab title="Kubernetes">
+
+Doris provides an official **Doris Operator** for Kubernetes that manages FE and BE as custom resources, handles pod scheduling, rolling upgrades, and automatic BE registration.
+
+### Install the Doris Operator
+
+```bash
+# Install the CRDs and operator using kubectl
+kubectl apply -f https://raw.githubusercontent.com/apache/doris-operator/master/config/crd/bases/doris.apache.com_dorisclusters.yaml
+kubectl apply -f https://raw.githubusercontent.com/apache/doris-operator/master/config/operator/disaggregated-operator.yaml
+```
+
+### Deploy a DorisCluster
+
+Create a `doris-cluster.yaml` manifest:
+
+```yaml
+apiVersion: doris.apache.com/v1
+kind: DorisCluster
+metadata:
+  name: doriscluster-sample
+  namespace: default
+spec:
+  feSpec:
+    replicas: 3
+    image: apache/doris:2.1.0-fe
+    requests:
+      cpu: "4"
+      memory: 8Gi
+    limits:
+      cpu: "8"
+      memory: 16Gi
+    persistentVolumes:
+      - mountPath: /opt/apache-doris/fe/doris-meta
+        name: fe-meta
+        persistentVolumeClaimSpec:
+          accessModes:
+            - ReadWriteOnce
+          resources:
+            requests:
+              storage: 50Gi
+  beSpec:
+    replicas: 3
+    image: apache/doris:2.1.0-be
+    requests:
+      cpu: "8"
+      memory: 16Gi
+    limits:
+      cpu: "16"
+      memory: 32Gi
+    persistentVolumes:
+      - mountPath: /opt/apache-doris/be/storage
+        name: be-storage
+        persistentVolumeClaimSpec:
+          accessModes:
+            - ReadWriteOnce
+          resources:
+            requests:
+              storage: 500Gi
+```
+
+Apply it to your cluster:
+
+```bash
+kubectl apply -f doris-cluster.yaml
+```
+
+Monitor the rollout:
+
+```bash
+kubectl get dorisclusters
+kubectl get pods -l app.kubernetes.io/component=fe
+kubectl get pods -l app.kubernetes.io/component=be
+```
+
+### Connect to the cluster
+
+The operator creates a Service for the FE query port:
+
+```bash
+kubectl get svc doriscluster-sample-fe
+```
+
+Forward the MySQL port locally for testing:
+
+```bash
+kubectl port-forward svc/doriscluster-sample-fe 9030:9030
+mysql -h 127.0.0.1 -P 9030 -uroot
+```
+
+<Note>
+  The Doris Operator source and full documentation are available at [github.com/apache/doris-operator](https://github.com/apache/doris-operator). Refer to the operator docs for storage class configuration, authentication, TLS, and upgrade procedures.
+</Note>
+
+<Warning>
+  Kubernetes deployments require persistent volumes with `ReadWriteOnce` access mode. Do not use `emptyDir` for FE metadata or BE storage — data will be lost when pods restart.
+</Warning>
+
+</Tab>
+
+</Tabs>
+
+## Verify your installation
+
+Regardless of the deployment method, run these checks after the cluster is up:
+
+```sql
+-- Check FE status
+SHOW FRONTENDS\G
+
+-- Check BE status (Alive should be true for all nodes)
+SHOW BACKENDS\G
+
+-- Run a test query
+SELECT NOW();
+```
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card title="Quick start" icon="rocket" href="/quickstart">
+    Create your first table, load data, and run analytical queries.
+  </Card>
+  <Card title="Data ingestion" icon="upload" href="/ingestion/overview">
+    Load data from Kafka, S3, HDFS, MySQL Binlog, and more.
+  </Card>
+</CardGroup>

@@ -1,0 +1,268 @@
+---
+title: "Security"
+description: Configure authentication, user privileges, row-level policies, and data encryption in Apache Doris.
+---
+
+## User management
+
+Doris uses a MySQL-compatible authentication model. Users are identified by a `user@host` pair, where `host` accepts exact IPs, CIDR ranges, or `%` as a wildcard.
+
+```sql
+-- Create a user accessible from any host
+CREATE USER 'analyst'@'%' IDENTIFIED BY 'secure_password';
+
+-- Create a user restricted to a subnet (CIDR notation)
+CREATE USER 'etl_user'@'10.0.0.0/255.255.255.0' IDENTIFIED BY 'secret';
+
+-- Change a user's password
+ALTER USER 'analyst'@'%' IDENTIFIED BY 'new_password';
+
+-- Drop a user
+DROP USER 'analyst'@'%';
+
+-- List all users and their grants
+SHOW ALL GRANTS;
+```
+
+---
+
+## Roles and privileges
+
+Doris implements RBAC through roles. Grant privileges to a role, then assign the role to users.
+
+```sql
+-- Create a role
+CREATE ROLE analyst_role;
+
+-- Grant table-level SELECT to the role
+GRANT SELECT ON mydb.orders TO ROLE analyst_role;
+
+-- Grant database-wide SELECT
+GRANT SELECT ON mydb.* TO ROLE analyst_role;
+
+-- Assign the role to a user
+GRANT analyst_role TO 'analyst'@'%';
+
+-- Grant full admin access with the ability to re-grant
+GRANT ALL ON *.* TO 'admin_user'@'%' WITH GRANT OPTION;
+
+-- Revoke a privilege from a role
+REVOKE SELECT ON mydb.orders FROM ROLE analyst_role;
+
+-- Drop a role
+DROP ROLE analyst_role;
+```
+
+---
+
+## Privilege types
+
+| Privilege | Scope | Description |
+|-----------|-------|-------------|
+| `SELECT` | Table / Database | Query data |
+| `INSERT` | Table / Database | Insert, load, and stream-load data |
+| `ALTER` | Table / Database | Modify table schema |
+| `CREATE` | Database | Create tables, views, and materialized views |
+| `DROP` | Table / Database | Drop tables and databases |
+| `LOAD` | Table / Database | Broker load, routine load, and stream load |
+| `EXPORT` | Table / Database | Export data to external storage |
+| `ADMIN` | Global | Full administrative access |
+| `NODE` | Global | Add, drop, and decommission cluster nodes |
+| `GRANT` | Any scope | Grant or revoke privileges to other users |
+
+---
+
+## Row-level security
+
+Row policies filter rows returned by queries based on the user or role making the request. They are defined in `RowPolicy.java` and evaluated transparently at query time — no application changes are required.
+
+Policies have two filter types:
+- **PERMISSIVE** — rows matching the predicate are allowed; multiple permissive policies are OR-ed together.
+- **RESTRICTIVE** — rows not matching the predicate are blocked; multiple restrictive policies are AND-ed together.
+
+```sql
+-- Analysts only see rows where region matches their username
+CREATE ROW POLICY region_policy
+ON mydb.sales
+AS RESTRICTIVE
+TO analyst_role
+USING (region = current_user());
+
+-- A specific user only sees their own orders
+CREATE ROW POLICY own_orders_policy
+ON mydb.orders
+AS RESTRICTIVE
+TO 'analyst'@'%'
+USING (owner_id = current_user());
+
+-- Show existing row policies
+SHOW ROW POLICY FOR mydb.sales;
+
+-- Drop a row policy
+DROP ROW POLICY region_policy ON mydb.sales;
+```
+
+<Note>
+Row policies apply to `SELECT`, `INSERT ... SELECT`, and `CREATE TABLE AS SELECT`. They do not apply to `ADMIN` users.
+</Note>
+
+---
+
+## Column-level access
+
+Grant `SELECT` on specific columns to prevent access to sensitive fields without creating views:
+
+```sql
+-- Grant access to non-sensitive columns only
+GRANT SELECT(order_id, status, amount, order_date)
+ON mydb.orders
+TO 'analyst'@'%';
+
+-- Columns not listed (e.g., customer_ssn, credit_card_token) are inaccessible
+-- Attempting to query them returns a privilege error
+```
+
+---
+
+## Data masking
+
+For basic data masking at query time, use views or computed columns to expose masked values. Doris also provides a built-in `digital_masking` scalar function for masking numeric strings (such as phone numbers, ID card numbers, or credit card numbers) by replacing middle digits with asterisks:
+
+```sql
+-- Mask a phone number stored as a string: keep first 3 and last 4 digits
+SELECT digital_masking(phone) AS masked_phone FROM customers LIMIT 10;
+-- Example output: 138****1234
+
+-- Create a view that exposes masked data to analysts
+CREATE VIEW customers_masked AS
+SELECT
+    user_id,
+    name,
+    digital_masking(phone)                    AS phone,
+    CONCAT(LEFT(email, 2), '****@****.com')   AS email,
+    region
+FROM customers;
+
+-- Grant analysts access to the view, not the base table
+GRANT SELECT ON mydb.customers_masked TO ROLE analyst_role;
+```
+
+<Tip>
+Restricting access to base tables and exposing masked views to less-privileged roles is the standard pattern for data masking in Doris.
+</Tip>
+
+---
+
+## SSL/TLS
+
+Enable HTTPS for the BE HTTP API and MySQL connections by setting the following in `be.conf` (see `conf/be.conf`):
+
+```ini
+# be.conf
+
+enable_https = true
+ssl_certificate_path = /path/to/cert.pem
+ssl_private_key_path = /path/to/key.pem
+```
+
+The certificate must be in PEM format. Restart the BE process after changing these values.
+
+<Tip>
+Use a certificate signed by your internal CA or a public CA. Self-signed certificates require clients to disable certificate verification, which reduces the security benefit.
+</Tip>
+
+---
+
+## LDAP authentication
+
+Doris supports LDAP-based authentication for enterprise SSO. Configuration lives in `conf/ldap.conf`:
+
+```ini
+# ldap.conf
+
+ldap_authentication_enabled = true
+ldap_host = 192.168.1.10
+ldap_port = 389
+
+# DN used by Doris to look up other users
+ldap_admin_name = cn=admin,dc=company,dc=com
+
+# Where to search for user entries
+ldap_user_basedn = ou=people,dc=company,dc=com
+
+# Filter to locate a user entry; {login} is replaced by the connecting username
+ldap_user_filter = (&(uid={login}))
+
+# Where to search for group entries
+ldap_group_basedn = ou=group,dc=company,dc=com
+```
+
+After editing `ldap.conf`, restart the FE. Then set the LDAP admin bind password from inside Doris:
+
+```sql
+SET ldap_admin_password = 'your_ldap_bind_password';
+```
+
+For LDAPS (port 636), enable TLS:
+
+```ini
+ldap_use_ssl = true
+ldap_port = 636
+```
+
+<Note>
+LDAP authentication is additive. Local Doris users continue to work even when LDAP is enabled. If a username exists in both, the local account takes precedence.
+</Note>
+
+---
+
+## Authentication integrations
+
+Doris also supports pluggable authentication via `CREATE AUTHENTICATION INTEGRATION`, which manages external identity providers as named objects persisted in FE metadata (`AuthenticationIntegrationMgr.java`):
+
+```sql
+-- Create an LDAP integration object
+CREATE AUTHENTICATION INTEGRATION corp_ldap
+PROPERTIES (
+    "type"        = "ldap",
+    "ldap_host"   = "192.168.1.10",
+    "ldap_port"   = "389"
+);
+
+-- Alter integration properties (type cannot be changed after creation)
+ALTER AUTHENTICATION INTEGRATION corp_ldap
+SET PROPERTIES ("ldap_port" = "636");
+
+-- Drop an integration
+DROP AUTHENTICATION INTEGRATION corp_ldap;
+```
+
+---
+
+## Audit log
+
+Every DDL and DML statement executed in Doris is written to `$DORIS_HOME/log/fe.audit.log`. The audit log records:
+
+- Timestamp and query ID
+- User and client IP
+- Database context
+- Full SQL text
+- Execution time and rows returned
+- Success or failure status
+
+Configure audit log behavior in `fe.conf`:
+
+```ini
+# fe.conf
+
+# Modules to audit: slow_query logs queries exceeding qe_slow_log_ms;
+# query logs all statements
+audit_log_modules = slow_query, query
+
+# Threshold for slow query logging (milliseconds)
+qe_slow_log_ms = 5000
+```
+
+<Warning>
+The audit log can grow quickly on high-throughput clusters. Configure log rotation with `audit_log_roll_num` and ship logs to a centralized store for long-term retention and compliance auditing.
+</Warning>

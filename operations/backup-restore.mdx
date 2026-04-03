@@ -1,0 +1,202 @@
+---
+title: "Backup and Restore"
+description: Back up and restore Apache Doris databases and tables using object storage or HDFS.
+---
+
+## Overview
+
+Doris backup and restore is snapshot-based. When a backup runs, BE nodes take consistent tablet snapshots, upload them to a remote repository, and the FE persists metadata describing the snapshot. Restoring replays that metadata and downloads tablet data back to BE nodes.
+
+Key properties of the system:
+- **Repository targets** — S3-compatible object storage or HDFS
+- **Granularity** — single table, a set of tables, or an entire database
+- **Backup types** — `full` only (incremental snapshots are not supported)
+- **Consistency** — snapshot isolation; ongoing writes are not blocked during backup
+
+The backup state machine progresses through these states (defined in `BackupJob.BackupJobState`):
+
+```
+PENDING → SNAPSHOTING → UPLOAD_SNAPSHOT → UPLOADING → SAVE_META → UPLOAD_INFO → FINISHED
+                                                                               → CANCELLED
+```
+
+---
+
+## Create a repository
+
+A repository is a named reference to a remote storage location. You must create one before running any backup.
+
+<Tabs>
+  <Tab title="S3">
+    ```sql
+    CREATE REPOSITORY my_s3_repo
+    WITH S3
+    ON LOCATION "s3://my-backup-bucket/doris-backups"
+    PROPERTIES
+    (
+        "s3.endpoint"   = "s3.amazonaws.com",
+        "s3.region"     = "us-east-1",
+        "s3.access_key" = "YOUR_ACCESS_KEY",
+        "s3.secret_key" = "YOUR_SECRET_KEY"
+    );
+    ```
+
+    For S3-compatible services (MinIO, Ceph RGW, etc.), override `s3.endpoint` with your gateway address.
+  </Tab>
+  <Tab title="HDFS">
+    ```sql
+    CREATE REPOSITORY hdfs_repo
+    WITH HDFS
+    ON LOCATION "hdfs://namenode:9000/doris-backups"
+    PROPERTIES
+    (
+        "fs.defaultFS"    = "hdfs://namenode:9000",
+        "hadoop.username" = "hdfs"
+    );
+    ```
+  </Tab>
+</Tabs>
+
+Verify the repository was created:
+
+```sql
+SHOW REPOSITORIES;
+```
+
+<Note>
+Repository metadata is stored in FE; the remote path must be reachable from all BE nodes, because BE processes perform the actual upload and download.
+</Note>
+
+---
+
+## Perform a backup
+
+```sql
+-- Full backup of an entire database
+BACKUP SNAPSHOT mydb.snapshot_20240101
+TO my_s3_repo
+ON (mydb)
+PROPERTIES ("type" = "full");
+
+-- Full backup of specific tables with a custom timeout
+BACKUP SNAPSHOT mydb.snapshot_tables
+TO my_s3_repo
+ON (mydb.orders, mydb.order_items)
+PROPERTIES (
+    "type"    = "full",
+    "timeout" = "3600"
+);
+```
+
+The snapshot label (`mydb.snapshot_20240101`) is scoped to the database. Only one backup job can run per database at a time.
+
+---
+
+## Check backup status
+
+```sql
+SHOW BACKUP FROM mydb\G
+```
+
+The `State` column shows the current phase. A completed backup shows `FINISHED`; a failed backup shows `CANCELLED` with an error message in `Status`.
+
+| State | Meaning |
+|-------|---------|
+| `PENDING` | Job created; snapshot tasks being sent to BEs |
+| `SNAPSHOTING` | BEs taking tablet snapshots |
+| `UPLOAD_SNAPSHOT` | Upload tasks being dispatched to BEs |
+| `UPLOADING` | BEs uploading snapshot files to the repository |
+| `SAVE_META` | FE writing backup metadata to local disk |
+| `UPLOAD_INFO` | FE uploading metadata and job info to the repository |
+| `FINISHED` | Backup complete |
+| `CANCELLED` | Backup failed or was manually cancelled |
+
+---
+
+## Restore from backup
+
+```sql
+-- Restore all tables to the original database
+RESTORE SNAPSHOT mydb.snapshot_20240101
+FROM my_s3_repo
+PROPERTIES
+(
+    "backup_timestamp" = "2024-01-01-00-00-00",
+    "replication_num"  = "3",
+    "timeout"          = "7200"
+);
+
+-- Restore a single table under a different name
+RESTORE SNAPSHOT mydb.snapshot_20240101
+FROM my_s3_repo
+ON (orders AS orders_restored)
+PROPERTIES ("backup_timestamp" = "2024-01-01-00-00-00");
+```
+
+The `backup_timestamp` must match a timestamp listed in `SHOW SNAPSHOT ON <repo>`. Tables being restored must not already exist in the target database.
+
+<Warning>
+Restoring into an existing table is not supported. Drop the target table first, or restore under a different name using `AS`.
+</Warning>
+
+---
+
+## Check restore status
+
+```sql
+SHOW RESTORE FROM mydb\G
+```
+
+The restore job progresses through similar states to backup. Watch `State` until it reaches `FINISHED`.
+
+---
+
+## Cancel a backup or restore
+
+```sql
+-- Cancel an in-progress backup
+CANCEL BACKUP FROM mydb;
+
+-- Cancel an in-progress restore
+CANCEL RESTORE FROM mydb;
+```
+
+Cancellation is best-effort. If the job has already reached `UPLOAD_INFO` or `FINISHED`, it cannot be cancelled.
+
+---
+
+## Show available snapshots
+
+List snapshots stored in a repository to find the correct timestamp for a restore:
+
+```sql
+-- List all snapshots in a repository
+SHOW SNAPSHOT ON my_s3_repo;
+
+-- Filter by snapshot name
+SHOW SNAPSHOT ON my_s3_repo WHERE SNAPSHOT = "snapshot_20240101";
+```
+
+The output includes the snapshot name, timestamp, database, and the tables it contains.
+
+---
+
+## Best practices
+
+<AccordionGroup>
+  <Accordion title="Schedule regular snapshots">
+    Automate backups using a cron job or workflow scheduler that issues `BACKUP SNAPSHOT` via the MySQL client. A daily full backup of critical databases is a reasonable baseline.
+  </Accordion>
+  <Accordion title="Test restores periodically">
+    A backup that has never been restored is an untested backup. Restore to a staging cluster on a regular schedule to verify data integrity and measure restore time.
+  </Accordion>
+  <Accordion title="Retain multiple snapshot versions">
+    Keep at least 7 daily snapshots in the repository before deleting older ones. This provides a recovery window for silent data corruption that may not be detected immediately.
+  </Accordion>
+  <Accordion title="Monitor backup job duration">
+    Large databases can take hours to back up. Set `timeout` in `PROPERTIES` to a value larger than your expected backup window, and alert on jobs that remain in non-`FINISHED` states past the expected duration.
+  </Accordion>
+  <Accordion title="Use separate repositories per environment">
+    Isolate production and staging snapshots in separate bucket prefixes or separate repositories to avoid accidental cross-environment restores.
+  </Accordion>
+</AccordionGroup>

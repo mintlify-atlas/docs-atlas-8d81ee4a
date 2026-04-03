@@ -1,0 +1,253 @@
+---
+title: 'Joins and multi-table queries'
+description: 'Understand join strategies and best practices for multi-table analytical queries in Apache Doris.'
+keywords: ['join', 'colocate join', 'broadcast join', 'shuffle join', 'bucket shuffle join', 'runtime filter', 'explain']
+---
+
+Doris supports all standard SQL join types and has four distinct physical join strategies. Choosing — or hinting — the right strategy is one of the highest-leverage performance tuning knobs available.
+
+## Join types
+
+All standard SQL join types are supported:
+
+| Join type | SQL | Behavior |
+|---|---|---|
+| Inner join | `INNER JOIN` / `JOIN` | Only matching rows from both sides |
+| Left outer | `LEFT OUTER JOIN` / `LEFT JOIN` | All left rows; NULLs where right has no match |
+| Right outer | `RIGHT OUTER JOIN` / `RIGHT JOIN` | All right rows; NULLs where left has no match |
+| Full outer | `FULL OUTER JOIN` | All rows from both sides with NULLs for non-matches |
+| Cross join | `CROSS JOIN` | Cartesian product — use with care |
+| Left semi | `LEFT SEMI JOIN` | Left rows that have at least one match on the right |
+| Left anti | `LEFT ANTI JOIN` | Left rows that have **no** match on the right |
+| Right semi | `RIGHT SEMI JOIN` | Right rows that have at least one match on the left |
+| Right anti | `RIGHT ANTI JOIN` | Right rows that have **no** match on the left |
+
+```sql
+-- Semi join: users who placed at least one order
+SELECT u.user_id, u.name
+FROM users u
+LEFT SEMI JOIN orders o ON u.user_id = o.user_id;
+
+-- Anti join: users who never placed an order
+SELECT u.user_id, u.name
+FROM users u
+LEFT ANTI JOIN orders o ON u.user_id = o.user_id;
+```
+
+## Join strategies
+
+The Nereids CBO optimizer (implemented in `NereidsPlanner`) selects a physical join strategy based on table statistics. You can also force a strategy with hints.
+
+<AccordionGroup>
+  <Accordion title="Shuffle join (repartition join)">
+    Both sides of the join are repartitioned by hash of the join key before the join executes. Every BE node holds a partition of each side.
+
+    - **Best for**: large-large table joins where neither side fits in broadcast memory.
+    - **Network cost**: two-sided shuffle — both sides are redistributed.
+    - **When optimizer picks it**: when the right (build) side exceeds the broadcast size threshold (default ~100 MB).
+
+    ```sql
+    SELECT /*+ SHUFFLE(t2) */ t1.order_id, t2.name
+    FROM large_orders t1
+    JOIN large_customers t2 ON t1.user_id = t2.user_id;
+    ```
+  </Accordion>
+
+  <Accordion title="Broadcast join">
+    The smaller (build) side is broadcast in full to every BE node that holds part of the larger (probe) side. The probe side is not moved.
+
+    - **Best for**: star-schema joins where a large fact table joins a small dimension.
+    - **Network cost**: one-sided — only the build side is sent.
+    - **Constraint**: the build side must fit in memory on each BE node. Default threshold: `max_broadcast_row_count` session variable.
+
+    ```sql
+    SELECT /*+ BROADCAST(dim) */ f.*, dim.category_name
+    FROM fact_sales f
+    JOIN dim_products dim ON f.product_id = dim.product_id;
+    ```
+  </Accordion>
+
+  <Accordion title="Bucket shuffle join">
+    When the join key matches the **distribution key** of the probe-side table, Doris can send only the matching buckets of the build side to the relevant BE nodes. The probe side stays in place.
+
+    - **Best for**: joins where the join key is the distribution key of the larger table.
+    - **Network cost**: partial shuffle of the build side only — significantly less than a full shuffle join.
+    - **Automatic**: the optimizer detects distribution key alignment automatically.
+  </Accordion>
+
+  <Accordion title="Colocate join">
+    When both tables belong to the **same colocate group** and are distributed by the same key with the same bucket count, matching data buckets are already on the same BE node. No data movement is required at all.
+
+    - **Best for**: frequently-joined tables that can be designed together (e.g., `orders` and `order_items`).
+    - **Network cost**: zero.
+    - **Requirement**: same colocate group, same distribution key type, same bucket count, same replication number.
+  </Accordion>
+</AccordionGroup>
+
+## Colocate join setup
+
+Declare the same `colocate_with` property on both tables. Doris will place matching buckets on the same BE nodes and skip all network shuffle during joins.
+
+```sql
+-- Both tables distributed by user_id with the same bucket count and colocate group
+CREATE TABLE orders (
+    order_id  BIGINT        NOT NULL,
+    user_id   BIGINT        NOT NULL,
+    order_date DATE         NOT NULL,
+    amount    DECIMAL(12,2) NOT NULL,
+    status    VARCHAR(32)
+)
+UNIQUE KEY(order_id)
+DISTRIBUTED BY HASH(user_id) BUCKETS 16
+PROPERTIES (
+    "replication_num"  = "3",
+    "colocate_with"    = "order_group"
+);
+
+CREATE TABLE order_items (
+    item_id    BIGINT  NOT NULL,
+    order_id   BIGINT  NOT NULL,
+    user_id    BIGINT  NOT NULL,
+    product_id INT     NOT NULL,
+    qty        INT,
+    amount     DECIMAL(12,2)
+)
+DUPLICATE KEY(item_id)
+DISTRIBUTED BY HASH(user_id) BUCKETS 16
+PROPERTIES (
+    "replication_num"  = "3",
+    "colocate_with"    = "order_group"
+);
+```
+
+Once both tables are in the same colocate group with the same distribution key (`user_id`) and the same bucket count (`16`), the following join executes with zero network traffic:
+
+```sql
+-- Colocate join: no data movement
+SELECT o.order_date, SUM(i.amount) AS revenue
+FROM orders o
+JOIN order_items i ON o.user_id = i.user_id AND o.order_id = i.order_id
+GROUP BY o.order_date;
+```
+
+<Note>
+All tables in the same colocate group must have **identical** `DISTRIBUTED BY HASH(...)` key types, the same bucket count, and the same replication number. Adding a table that violates these constraints will fail.
+</Note>
+
+Verify colocate group membership:
+
+```sql
+SHOW PROC '/colocation_group';
+```
+
+## Join hints
+
+Force a specific join strategy by placing a comment hint after `SELECT` or after `JOIN`:
+
+```sql
+-- Force broadcast on the small dimension table
+SELECT /*+ BROADCAST(dim) */ f.sale_date, f.amount, dim.category_name
+FROM fact_sales f
+JOIN small_dim dim ON f.product_id = dim.product_id;
+
+-- Force shuffle join on both sides
+SELECT /*+ SHUFFLE(t2) */ t1.user_id, t2.region
+FROM large_events t1
+JOIN large_users t2 ON t1.user_id = t2.user_id;
+
+-- Inline bracket syntax (also accepted)
+SELECT t1.*, t2.name
+FROM large_table t1
+JOIN [BROADCAST] small_table t2 ON t1.id = t2.id;
+```
+
+<Warning>
+A misplaced hint can hurt performance. Use `EXPLAIN VERBOSE` to confirm that the optimizer applied your hint — the `Hint log` section at the end of the EXPLAIN output shows which hints were `Used`, `UnUsed`, or caused a `SyntaxError`.
+</Warning>
+
+## Runtime filters
+
+Runtime filters are predicates computed from the **build** side of a hash join and pushed down to the **probe** side before the scan starts. This prunes rows at the storage layer before they cross the network.
+
+Doris supports three runtime filter types:
+
+| Type | How it works | Best for |
+|---|---|---|
+| **Bloom filter** | Probabilistic membership test | High-cardinality join keys |
+| **Min-Max filter** | Range predicate `col BETWEEN min AND max` | Ordered or range-clustered data |
+| **In-list filter** | Exact set membership (`col IN (...)`) | Low-cardinality join keys (up to 1024 values) |
+
+The optimizer automatically configures runtime filter types based on NDV estimates. To verify that runtime filters were generated and pushed down:
+
+```sql
+EXPLAIN VERBOSE
+SELECT f.*, d.region
+FROM fact_orders f
+JOIN dim_customers d ON f.user_id = d.user_id
+WHERE f.order_date >= '2024-01-01';
+```
+
+Look for `runtime filters` entries in the scan node sections of the output, e.g.:
+
+```
+runtime filters: RF000[bloom] <- d.user_id
+```
+
+Adjust runtime filter behavior with session variables:
+
+```sql
+-- Set the filter type bitmask: 1=in, 2=bloom, 4=min-max (can be combined)
+SET runtime_filter_type = 2;      -- Bloom filter only
+
+-- Maximum wait time for a runtime filter to arrive before the scan starts
+SET runtime_filter_wait_time_ms = 1000;
+```
+
+## Multi-table aggregation example
+
+A typical analytical query joining three tables:
+
+```sql
+SELECT
+    o.order_date,
+    c.region,
+    SUM(oi.amount)            AS total_revenue,
+    COUNT(DISTINCT o.user_id) AS unique_buyers
+FROM orders o
+JOIN order_items oi ON o.order_id = oi.order_id AND o.user_id = oi.user_id
+JOIN customers   c  ON o.user_id  = c.user_id
+WHERE o.order_date >= '2024-01-01'
+GROUP BY o.order_date, c.region
+ORDER BY total_revenue DESC
+LIMIT 100;
+```
+
+Design notes for this query:
+- `orders` and `order_items` can be colocated on `user_id` — zero shuffle for that join.
+- `customers` is typically a smaller dimension — the optimizer will likely broadcast it.
+- The filter on `order_date` triggers partition pruning if `orders` is partitioned by date.
+
+## EXPLAIN
+
+Use `EXPLAIN` to inspect how Doris plans to execute a query.
+
+```sql
+-- Logical plan with estimated row counts and costs
+EXPLAIN SELECT ...;
+
+-- Physical plan including join strategy, runtime filter info, and distribution
+EXPLAIN VERBOSE SELECT ...;
+
+-- Physical plan annotated with actual row counts after execution
+EXPLAIN ANALYZE SELECT ...;
+
+-- Compact shape summary — useful for quickly comparing plans
+EXPLAIN SHAPE PLAN SELECT ...;
+```
+
+Key things to check in the output:
+
+- **Join type** shown on the `HASH JOIN` node: `BROADCAST`, `PARTITIONED` (shuffle), `BUCKET_SHUFFLE`, or `COLOCATE`.
+- **Runtime filters** listed under scan nodes.
+- **Hint log** at the end: confirms which hints were applied.
+- **Row estimates** on each node: large estimation errors indicate stale or missing statistics — run `ANALYZE TABLE` to fix.

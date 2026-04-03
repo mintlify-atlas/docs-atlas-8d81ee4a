@@ -1,80 +1,217 @@
 ---
-title: "Quickstart"
-description: "Start building awesome documentation in minutes"
+title: 'Quick Start'
+description: Get up and running with Apache Doris quickly.
 ---
 
-## Get started in three steps
+Apache Doris is a high-performance MPP analytical database with full MySQL protocol compatibility. This guide walks you from a fresh download to running your first analytical query in minutes.
 
-Get your documentation site running locally and make your first customization.
+## Prerequisites
 
-### Step 1: Set up your local environment
+Before you begin, make sure you have:
 
-<AccordionGroup>
-  <Accordion icon="copy" title="Clone your docs locally">
-    During the onboarding process, you created a GitHub repository with your docs content if you didn't already have one. You can find a link to this repository in your [dashboard](https://dashboard.mintlify.com).
-    
-    To clone the repository locally so that you can make and preview changes to your docs, follow the [Cloning a repository](https://docs.github.com/en/repositories/creating-and-managing-repositories/cloning-a-repository) guide in the GitHub docs.
-  </Accordion>
-  <Accordion icon="rectangle-terminal" title="Start the preview server">
-    1. Install the Mintlify CLI: `npm i -g mint`
-    2. Navigate to your docs directory and run: `mint dev`
-    3. Open `http://localhost:3000` to see your docs live!
-    
-    <Tip>Your preview updates automatically as you edit files.</Tip>
-  </Accordion>
-</AccordionGroup>
+- **Linux** (x86_64 or aarch64) — macOS is supported for development only
+- **JDK 17** — both FE and BE require exactly JDK 17 (`java -version` should report `17.x`)
+- **MySQL client** — to connect to Doris after startup
+- At least **4 GB RAM** and **10 GB free disk** for a single-node setup
 
-### Step 2: Deploy your changes
+<Note>
+  Doris does not support JDK 8 or JDK 11. The startup scripts will exit with an error if the detected JDK version is not 17.
+</Note>
 
-<AccordionGroup>
-  <Accordion icon="github" title="Install our GitHub app">
-    Install the Mintlify GitHub app from your [dashboard](https://dashboard.mintlify.com/settings/organization/github-app).
-    
-    Our GitHub app automatically deploys your changes to your docs site, so you don't need to manage deployments yourself.
-</Accordion>
-<Accordion icon="palette" title="Update your site name and colors">
-    For a first change, let's update the name and colors of your docs site.
+## Steps
 
-    1. Open `docs.json` in your editor.
-    2. Change the `"name"` field to your project name.
-    3. Update the `"colors"` to match your brand.
-    4. Save and see your changes instantly at `http://localhost:3000`.
+<Steps>
 
-    <Tip>Try changing the primary color to see an immediate difference!</Tip>
-  </Accordion>
-</AccordionGroup>
+<Step title="Download Apache Doris">
 
-### Step 3: Go live
+Go to [doris.apache.org/download](https://doris.apache.org/download) and download the latest binary release for your architecture. Choose the `apache-doris-x.x.x-bin-x64.tar.gz` (or `arm64`) package that bundles both FE and BE.
 
-<Accordion icon="rocket" title="Publish your docs">
-  1. Commit and push your changes.
-  2. Your docs will update and be live in moments!
-</Accordion>
+```bash
+# Replace x.x.x with the current release version
+wget https://apache-doris-releases.oss-accelerate.aliyuncs.com/apache-doris-2.1.0-bin-x64.tar.gz
+tar -xzf apache-doris-2.1.0-bin-x64.tar.gz
+cd apache-doris-2.1.0-bin-x64
+```
+
+The extracted directory contains two sub-directories: `fe/` (Frontend) and `be/` (Backend).
+
+</Step>
+
+<Step title="Start the Frontend (FE)">
+
+The Frontend handles query parsing, planning, metadata management, and serves the MySQL-compatible query port.
+
+```bash
+# Create the metadata directory (required before first start)
+mkdir -p fe/doris-meta
+
+# Start FE in daemon mode
+bin/start_fe.sh --daemon
+```
+
+Wait about 10 seconds for FE to initialize, then verify it is running:
+
+```bash
+curl http://127.0.0.1:8030/api/bootstrap
+```
+
+A successful response returns `{"status":"OK","msg":"success"}`. Check `fe/log/fe.log` if the process does not start.
+
+<Note>
+  FE listens on the following ports by default (from `conf/fe.conf`):
+  - `8030` — HTTP API and web UI
+  - `9030` — MySQL query port (used by your MySQL client)
+  - `9020` — Thrift RPC port
+  - `9010` — BDB edit log port
+</Note>
+
+</Step>
+
+<Step title="Start the Backend (BE)">
+
+The Backend stores data and executes query fragments. It must be registered with FE after it starts.
+
+First, set the kernel parameter required by BE:
+
+```bash
+sudo sysctl -w vm.max_map_count=2000000
+```
+
+Create the storage directory and start BE:
+
+```bash
+mkdir -p be/storage
+
+# Start BE in daemon mode
+bin/start_be.sh --daemon
+```
+
+Verify BE is up:
+
+```bash
+curl http://127.0.0.1:8040/api/health
+```
+
+</Step>
+
+<Step title="Connect via MySQL client and register the Backend">
+
+Connect to the FE using the MySQL client:
+
+```bash
+mysql -h 127.0.0.1 -P 9030 -uroot
+```
+
+The default `root` password is empty. Once connected, register the BE node:
+
+```sql
+ALTER SYSTEM ADD BACKEND "127.0.0.1:9050";
+```
+
+Confirm the BE registered successfully and its `Alive` column shows `true`:
+
+```sql
+SHOW BACKENDS\G
+```
+
+</Step>
+
+<Step title="Create a database and table">
+
+Create a database and a partitioned table for web traffic log events:
+
+```sql
+CREATE DATABASE IF NOT EXISTS demo;
+USE demo;
+
+CREATE TABLE IF NOT EXISTS demo.log_events (
+    event_time DATETIME NOT NULL,
+    event_type VARCHAR(50),
+    user_id BIGINT,
+    page VARCHAR(200),
+    duration_ms INT
+)
+DUPLICATE KEY(event_time, event_type)
+PARTITION BY RANGE(event_time)(
+    PARTITION p_2024 VALUES LESS THAN ("2025-01-01")
+)
+DISTRIBUTED BY HASH(user_id) BUCKETS 4
+PROPERTIES ("replication_num" = "1");
+```
+
+The `DUPLICATE KEY` model retains every inserted row — ideal for log and event data where duplicates are valid. `PARTITION BY RANGE` on `event_time` enables partition pruning so queries over a date range only scan the relevant partitions. `replication_num = "1"` is required for single-node clusters.
+
+</Step>
+
+<Step title="Load sample data">
+
+Insert a batch of sample log events using `INSERT INTO`:
+
+```sql
+INSERT INTO demo.log_events (event_time, event_type, user_id, page, duration_ms) VALUES
+    ('2024-03-15 08:01:23', 'page_view',  1001, '/home',         312),
+    ('2024-03-15 08:02:11', 'page_view',  1002, '/products',     850),
+    ('2024-03-15 08:03:45', 'click',      1001, '/products',     120),
+    ('2024-03-15 08:05:00', 'page_view',  1003, '/checkout',    1540),
+    ('2024-03-15 08:06:30', 'purchase',   1002, '/checkout',     980),
+    ('2024-03-15 09:10:05', 'page_view',  1004, '/home',         275),
+    ('2024-03-15 09:15:20', 'page_view',  1001, '/blog',         430),
+    ('2024-03-15 09:20:00', 'click',      1003, '/products',     205),
+    ('2024-03-15 10:00:00', 'purchase',   1004, '/checkout',    1120),
+    ('2024-03-15 10:30:00', 'page_view',  1005, '/home',         390);
+```
+
+</Step>
+
+<Step title="Run your first analytical query">
+
+Aggregate events and calculate per-type metrics with a `GROUP BY` query:
+
+```sql
+SELECT
+    event_type,
+    COUNT(*)                        AS event_count,
+    COUNT(DISTINCT user_id)         AS unique_users,
+    ROUND(AVG(duration_ms), 0)      AS avg_duration_ms,
+    MAX(duration_ms)                AS max_duration_ms
+FROM demo.log_events
+WHERE event_time >= '2024-03-15 00:00:00'
+  AND event_time <  '2024-03-16 00:00:00'
+GROUP BY event_type
+ORDER BY event_count DESC;
+```
+
+Expected output:
+
+```
++------------+-------------+--------------+-----------------+-----------------+
+| event_type | event_count | unique_users | avg_duration_ms | max_duration_ms |
++------------+-------------+--------------+-----------------+-----------------+
+| page_view  |           7 |            5 |             571 |            1540 |
+| click      |           2 |            2 |             163 |             205 |
+| purchase   |           2 |            2 |            1050 |            1120 |
++------------+-------------+--------------+-----------------+-----------------+
+```
+
+Doris applies partition pruning to limit the scan to the `p_2024` partition and uses hash distribution to parallelize the aggregation across buckets.
+
+</Step>
+
+</Steps>
 
 ## Next steps
 
-Now that you have your docs running, explore these key features:
-
 <CardGroup cols={2}>
-
-<Card title="Write Content" icon="pen-to-square" href="/essentials/markdown">
-  Learn MDX syntax and start writing your documentation.
-</Card>
-
-<Card title="Customize style" icon="palette" href="/essentials/settings">
-  Make your docs match your brand perfectly.
-</Card>
-
-<Card title="Add code examples" icon="square-code" href="/essentials/code">
-  Include syntax-highlighted code blocks.
-</Card>
-
-<Card title="API documentation" icon="code" href="/api-reference/introduction">
-  Auto-generate API docs from OpenAPI specs.
-</Card>
-
+  <Card title="Installation" icon="server" href="/installation">
+    Deploy Doris on Docker, bare metal, or Kubernetes for production use.
+  </Card>
+  <Card title="Core concepts" icon="book-open" href="/concepts/architecture">
+    Understand FE, BE, data models, and the query engine.
+  </Card>
+  <Card title="Data ingestion" icon="upload" href="/ingestion/overview">
+    Load data from Kafka, S3, HDFS, and MySQL Binlog.
+  </Card>
+  <Card title="SQL reference" icon="code" href="/query/sql-overview">
+    Explore Doris SQL syntax and built-in functions.
+  </Card>
 </CardGroup>
-
-<Note>
-  **Need help?** See our [full documentation](https://mintlify.com/docs) or join our [community](https://mintlify.com/community).
-</Note>

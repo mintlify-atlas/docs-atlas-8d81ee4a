@@ -1,0 +1,158 @@
+---
+title: "Broker Load"
+description: "Batch load large datasets from HDFS, S3, and other object stores into Apache Doris."
+---
+
+Broker Load is an asynchronous, high-throughput ingestion method for loading large datasets from distributed file systems and object stores. It supports Parquet, ORC, and CSV formats, and reads files directly from HDFS, Amazon S3, Google Cloud Storage, and Azure Blob Storage without local staging.
+
+<Note>
+  Broker Load is best for batch ETL jobs loading hundreds of GBs or TBs. For real-time streaming, use [Stream Load](/ingestion/stream-load) or [Routine Load](/ingestion/routine-load).
+</Note>
+
+## Load from S3
+
+```sql Load from S3
+LOAD LABEL mydb.s3_load_001
+(
+    DATA INFILE("s3://my-bucket/data/orders/*.parquet")
+    INTO TABLE orders
+    FORMAT AS "parquet"
+    (order_id, status, amount, created_at)
+)
+WITH S3
+(
+    "provider" = "S3",
+    "s3.endpoint" = "s3.amazonaws.com",
+    "s3.region" = "us-east-1",
+    "s3.access_key" = "YOUR_ACCESS_KEY",
+    "s3.secret_key" = "YOUR_SECRET_KEY"
+)
+PROPERTIES
+(
+    "timeout" = "3600",
+    "max_filter_ratio" = "0.1"
+);
+```
+
+## Load from HDFS
+
+```sql Load from HDFS
+LOAD LABEL mydb.hdfs_load_001
+(
+    DATA INFILE("hdfs://namenode:9000/user/data/events/dt=2024-01-01/*.orc")
+    INTO TABLE events
+    FORMAT AS "orc"
+    (event_time, user_id, event_type, page)
+    SET (event_time = str_to_date(event_time, '%Y-%m-%d %H:%i:%s'))
+)
+WITH HDFS
+(
+    "fs.defaultFS" = "hdfs://namenode:9000",
+    "hadoop.username" = "hdfs"
+);
+```
+
+## Check Job Status
+
+Broker Load is asynchronous. Poll the status after submitting:
+
+```sql
+SHOW LOAD WHERE LABEL = "s3_load_001"\G
+```
+
+The job moves through these states:
+
+| State | Description |
+|-------|-------------|
+| `PENDING` | Job queued, waiting for a slot |
+| `ETL` | Validating and transforming data |
+| `LOADING` | Writing data to BE nodes |
+| `FINISHED` | Load completed successfully |
+| `CANCELLED` | Load failed or was manually cancelled |
+
+## Cancel a Load
+
+```sql
+CANCEL LOAD WHERE LABEL = "s3_load_001";
+```
+
+## Column Mapping and Transformations
+
+Use the `SET` clause to transform source columns during load:
+
+```sql
+LOAD LABEL mydb.transform_load
+(
+    DATA INFILE("s3://bucket/raw/*.csv")
+    INTO TABLE users
+    COLUMNS TERMINATED BY ","
+    (raw_ts, user_id, raw_email, age_str)
+    SET (
+        created_at = str_to_date(raw_ts, '%Y-%m-%d %H:%i:%s'),
+        email = lower(raw_email),
+        age = cast(age_str as INT)
+    )
+    WHERE age > 0
+)
+WITH S3
+(
+    "s3.endpoint" = "s3.amazonaws.com",
+    "s3.region" = "us-east-1",
+    "s3.access_key" = "YOUR_KEY",
+    "s3.secret_key" = "YOUR_SECRET"
+);
+```
+
+## PROPERTIES Reference
+
+<ParamField path="timeout" type="integer">
+  Maximum job duration in seconds. Default: `14400` (4 hours).
+</ParamField>
+
+<ParamField path="max_filter_ratio" type="float">
+  Maximum fraction of rows that can be filtered (errors tolerated). Range: `0`–`1`. Default: `0` (strict mode).
+</ParamField>
+
+<ParamField path="load_parallelism" type="integer">
+  Number of parallel loading tasks per job. Increase for large imports. Default: `1`.
+</ParamField>
+
+<ParamField path="strict_mode" type="boolean">
+  When `true`, rows with type conversion failures are rejected. Default: `false`.
+</ParamField>
+
+<ParamField path="timezone" type="string">
+  Timezone for timestamp parsing. Default: `Asia/Shanghai`. Example: `"America/New_York"`.
+</ParamField>
+
+## S3 Properties Reference
+
+<ParamField path="s3.endpoint" type="string" required>
+  S3-compatible endpoint URL. For AWS: `s3.amazonaws.com`. For MinIO: your MinIO address.
+</ParamField>
+
+<ParamField path="s3.region" type="string">
+  AWS region. Example: `us-east-1`.
+</ParamField>
+
+<ParamField path="s3.access_key" type="string" required>
+  S3 access key ID.
+</ParamField>
+
+<ParamField path="s3.secret_key" type="string" required>
+  S3 secret access key.
+</ParamField>
+
+<ParamField path="provider" type="string">
+  Storage provider. One of `S3`, `GCP`, `AZURE`, `OSS`, `COS`. Default: `S3`.
+</ParamField>
+
+## Tips
+
+<Tip>
+  Use wildcard patterns (`*.parquet`, `dt=*/hour=*/*.orc`) to load multiple files in one job. Doris expands the pattern and loads all matching files in parallel.
+</Tip>
+
+<Warning>
+  Each label must be globally unique within a database. Reusing a label returns the result of the previous job with that label — useful for idempotency checks.
+</Warning>

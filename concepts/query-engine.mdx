@@ -1,0 +1,204 @@
+---
+title: "Query Engine"
+description: Nereids optimizer, vectorized execution, and Pipeline engine in Apache Doris.
+keywords: ["query engine", "Nereids", "optimizer", "vectorized", "pipeline", "MPP", "CBO", "RBO", "HBO"]
+---
+
+Apache Doris combines a modern query optimizer, a fully vectorized execution engine, and an event-driven pipeline scheduler to deliver high throughput and low latency across analytical workloads.
+
+## Nereids query optimizer
+
+Nereids is the next-generation query optimizer in Apache Doris, introduced as the default planner in Doris 2.0. It replaces the legacy optimizer with a unified framework that applies three complementary optimization strategies.
+
+```sql
+-- Nereids is enabled by default in Doris 2.0+.
+-- You can explicitly enable it per session if needed:
+SET enable_nereids_planner = true;
+```
+
+The optimizer implementation lives in `fe/fe-core/src/main/java/org/apache/doris/nereids/`. The entry point is `NereidsPlanner.java`, which orchestrates parsing, rewriting, cost-based optimization, and physical plan translation.
+
+### Rule-based optimizer (RBO)
+
+The RBO applies a sequence of logical rewrite rules to the query plan before cost estimation. These rewrites are purely structural — they are always beneficial regardless of data statistics.
+
+Key RBO rules (from `RuleType.java`):
+
+| Rule category         | Examples                                                              |
+| --------------------- | --------------------------------------------------------------------- |
+| Predicate pushdown    | `PUSH_DOWN_PREDICATE_THROUGH_AGGREGATION`, `PUSH_DOWN_JOIN_OTHER_CONDITION` |
+| Constant folding      | `CONSTANT_PROPAGATION`, `REWRITE_SIMPLE_AGG_TO_CONSTANT`             |
+| Subquery unnesting    | `SCALAR_APPLY_TO_JOIN`, `IN_APPLY_TO_JOIN`, `EXISTS_APPLY_TO_JOIN`   |
+| Column pruning        | `PRUNE_EMPTY_PARTITION`, `ELIMINATE_GROUP_BY_CONSTANT`               |
+| Predicate inference   | `INFER_PREDICATES`, `INFER_AGG_NOT_NULL`                             |
+
+The rewrite rules are organized into stages and applied in a defined order to avoid rule-loop risks. Rule registration is in `RuleSet.java`.
+
+### Cost-based optimizer (CBO)
+
+After RBO rewrites, the CBO enumerates multiple physical plan alternatives and chooses the one with the lowest estimated cost. The core CBO capability is **join reordering**: given N tables joined together, the CBO uses table statistics to find the join order that minimizes intermediate result sizes.
+
+Statistics are collected with:
+
+```sql
+-- Collect statistics for a table (full scan)
+ANALYZE TABLE orders;
+
+-- Collect statistics for specific columns only
+ANALYZE TABLE orders (order_id, status, amount);
+```
+
+After `ANALYZE TABLE`, the CBO uses row counts, NDV (number of distinct values), and histogram distributions stored in the internal statistics catalog to estimate cardinalities at each plan node and choose between hash join, broadcast join, and nested-loop join strategies.
+
+### History-based optimizer (HBO)
+
+The HBO records execution statistics from past query runs and feeds them back into future planning decisions. When the CBO's cardinality estimates are inaccurate (e.g., due to correlated predicates or stale statistics), the HBO can override or adjust the plan based on what actually happened at runtime.
+
+<Note>
+HBO is most effective in workloads with repeated query patterns, such as scheduled reports or parameterized dashboard queries. It requires no configuration beyond having Nereids enabled.
+</Note>
+
+## Vectorized execution engine
+
+The Doris execution engine operates on **columnar batches** rather than individual rows. Memory structures are laid out column-by-column (matching the on-disk storage format), which allows the engine to exploit:
+
+- **SIMD instructions**: operations such as equality comparisons, arithmetic, and hash computation are compiled to SIMD-vectorized CPU instructions, processing 8–32 values per instruction depending on the CPU and data type.
+- **Reduced function call overhead**: processing a batch of 1,024 rows with a single function call eliminates the per-row virtual dispatch overhead of row-based engines.
+- **Higher cache efficiency**: iterating over a single column's contiguous memory is cache-friendly; row-based access patterns scatter reads across many cache lines.
+
+The result is **5–10× throughput improvement** over row-based engines on wide-table aggregation and scan workloads, as documented in the Doris README.
+
+## Pipeline execution engine
+
+The Pipeline execution engine breaks a query into a DAG of **pipeline tasks** and executes them using a shared thread pool rather than spawning one thread per query. This design avoids thread explosion under high concurrency.
+
+The core abstractions live in `be/src/exec/pipeline/`:
+
+| File                          | Role                                                          |
+| ----------------------------- | ------------------------------------------------------------- |
+| `pipeline.h`                  | A pipeline: a linear chain of operators (source → ... → sink) |
+| `pipeline_task.h`             | A runnable unit: one instance of a pipeline for one data range |
+| `task_scheduler.h`            | Thread pool scheduler that drives pipeline tasks              |
+| `dependency.h`                | Blocking/unblocking mechanism for data-flow dependencies      |
+
+### Pipeline task lifecycle
+
+Each `PipelineTask` moves through a well-defined state machine:
+
+```
+INITED → RUNNABLE → BLOCKED → RUNNABLE → ... → FINISHED → FINALIZED
+```
+
+- **RUNNABLE**: the task has data to process and is eligible to be scheduled onto a worker thread.
+- **BLOCKED**: the task is waiting on a dependency (e.g., the probe side of a hash join waiting for the build side to finish, or a scan node waiting for IO).
+- **FINISHED**: the task has produced all output rows.
+- **FINALIZED**: resources have been released.
+
+A task is blocked via a `Dependency` object and woken up when the dependency signals readiness (e.g., the build hash table is complete). This replaces blocking thread synchronization with non-blocking state transitions, allowing worker threads to pick up other runnable tasks while waiting.
+
+### Adaptive parallelism
+
+Each pipeline has a `num_tasks` count that controls how many parallel instances of the pipeline run. Doris sets this based on the number of tablets being scanned, the number of BE nodes involved, and the available CPU cores. The `set_num_tasks()` method on `Pipeline` dynamically adjusts parallelism before execution begins.
+
+## MPP distributed execution
+
+For queries spanning multiple BE nodes, Doris compiles the query plan into **plan fragments** and ships them to the appropriate BE nodes for parallel execution.
+
+### Fragment distribution
+
+A query plan is split into fragments at **exchange nodes** (data redistribution points). Each fragment runs in parallel across multiple BE instances:
+
+```
+Fragment 0 (coordinator)
+  └── AggregationNode (final merge)
+        └── ExchangeNode  ← receives shuffled rows from Fragment 1
+
+Fragment 1 (runs on all BEs in parallel)
+  └── AggregationNode (partial agg)
+        └── HashJoinNode
+              ├── ExchangeNode  ← receives broadcast of Fragment 2
+              └── OlapScanNode  ← reads local tablets
+```
+
+### Join distribution strategies
+
+| Strategy        | When used                                                           |
+| --------------- | ------------------------------------------------------------------- |
+| Broadcast join  | Small build-side table: the entire build side is sent to every BE   |
+| Shuffle join    | Large build side: both sides are hash-partitioned by join key       |
+| Bucket join     | Both sides bucketed on the join key: no shuffle needed (co-located) |
+
+## Adaptive query execution and runtime filters
+
+At runtime, Doris generates **runtime filters** from the build side of hash joins and pushes them down to scan nodes on the probe side. This prunes data before it enters the join, reducing the volume of rows read and shuffled.
+
+Supported runtime filter types:
+
+| Filter type     | Description                                                           |
+| --------------- | --------------------------------------------------------------------- |
+| Bloom filter    | Probabilistic set membership; effective for high-cardinality joins    |
+| Min/Max filter  | Range filter; effective for sorted or range-clustered join keys       |
+| In filter       | Exact set membership; used when the build side is small               |
+
+Runtime filter generation and pushdown is orchestrated during plan execution. The filters are constructed on the build-side BE nodes and broadcast to the scan-side BE nodes before the scan begins.
+
+```
+Build side computes runtime filter:
+  hash_join_build → emit Bloom(order_id values)
+                        ↓ pushed to probe scan
+Probe side scan:
+  OlapScanNode (fact_table) → applies Bloom filter before reading tablets
+  → tablets that cannot match any order_id are skipped entirely
+```
+
+## Query hints
+
+You can influence the optimizer's decisions using SQL hints.
+
+### SET_VAR session hints
+
+Override a session variable for a single query without changing the global setting:
+
+```sql
+SELECT /*+ SET_VAR(parallel_fragment_exec_instance_num=8) */
+    COUNT(*), SUM(amount)
+FROM orders
+WHERE order_date >= '2025-01-01';
+```
+
+### Leading hint for join order
+
+Force a specific join order when the CBO's cardinality estimates are known to be wrong:
+
+```sql
+SELECT /*+ LEADING(orders customers products) */
+    o.order_id, c.name, p.product_name
+FROM orders o
+JOIN customers c ON o.customer_id = c.id
+JOIN products  p ON o.product_id  = p.id
+WHERE o.order_date >= '2025-01-01';
+```
+
+### Reading an EXPLAIN plan
+
+Use `EXPLAIN` to inspect the distributed plan that Nereids generates:
+
+```sql
+EXPLAIN SELECT site_id, COUNT(*) FROM log_events
+WHERE ts >= '2025-01-01' GROUP BY site_id;
+```
+
+The output shows plan fragments, the operators within each fragment, and the exchange type between fragments. Look for:
+
+- `VHASH JOIN` / `VBROADCAST JOIN`: vectorized join operators and their distribution strategy
+- `VOLAP_SCAN`: vectorized scan node with predicate pushdown and runtime filter application
+- `VAGGREGATE`: vectorized aggregation (two-phase: partial on each BE, final merge on coordinator)
+- `VEXCHANGE`: data redistribution point between fragments
+
+```sql
+-- For a detailed cost-annotated plan with statistics:
+EXPLAIN VERBOSE SELECT ...;
+
+-- For the physical plan including runtime filter info:
+EXPLAIN PLAN SELECT ...;
+```

@@ -1,0 +1,160 @@
+---
+title: "Data Models"
+description: Choose between Duplicate Key, Unique Key, and Aggregate Key models based on your use case.
+keywords: ["data model", "duplicate key", "unique key", "aggregate key", "table model", "keys type"]
+---
+
+Every table in Apache Doris is created with a **key model** that defines how Doris stores, deduplicates, and merges rows. Choosing the right model up front determines query performance, storage efficiency, and whether you can perform row-level updates.
+
+The three models map to the `KeysType` enum in the Doris catalog:
+
+| Internal type | SQL keyword      | Common name         |
+| ------------- | ---------------- | ------------------- |
+| `DUP_KEYS`    | `DUPLICATE KEY`  | Duplicate Key model |
+| `UNIQUE_KEYS` | `UNIQUE KEY`     | Unique Key model    |
+| `AGG_KEYS`    | `AGGREGATE KEY`  | Aggregate Key model |
+
+## Duplicate Key model
+
+The Duplicate Key model stores every row exactly as written. Rows with the same key values are **not** merged or deduplicated — all copies are retained. The `DUPLICATE KEY` columns define the **sort key**: data within each tablet is sorted by these columns to accelerate range scans and prefix-key lookups.
+
+**Best for**: raw event logs, time-series telemetry, append-only fact tables, or any use case where you need to retain every individual row.
+
+```sql
+CREATE TABLE log_events (
+    ts          DATETIME,
+    user_id     BIGINT,
+    event_type  VARCHAR(50),
+    duration_ms INT
+)
+DUPLICATE KEY(ts, user_id)
+DISTRIBUTED BY HASH(user_id) BUCKETS 16;
+```
+
+Key points:
+- Up to 3 columns can form the sort key (additional `DUPLICATE KEY` columns beyond 3 are still used for sorting but the prefix index covers only the first 36 bytes).
+- There is no background merge of rows; storage size equals the full volume of ingested data.
+- `INSERT INTO` and stream load always append; there is no implicit deduplication.
+
+## Unique Key model
+
+The Unique Key model enforces a primary key constraint: for any given key, only the **latest version** of a row is visible. This enables row-level upserts (insert-or-update) and deletes, making it suitable for Change Data Capture (CDC) pipelines from OLTP databases.
+
+**Best for**: syncing dimension tables or fact tables from MySQL/Postgres via Flink CDC or binlog, order management systems, or any use case where rows must be updatable by primary key.
+
+Doris provides two internal strategies for handling duplicates:
+
+<Tabs>
+  <Tab title="Merge-on-Write (recommended)">
+    With `enable_unique_key_merge_on_write = true`, Doris resolves duplicates **at write time** using a delete bitmap. Read performance is equivalent to the Duplicate model because no in-flight merging is needed during queries.
+
+    ```sql
+    CREATE TABLE orders (
+        order_id   BIGINT,
+        status     VARCHAR(20),
+        amount     DECIMAL(10,2),
+        updated_at DATETIME
+    )
+    UNIQUE KEY(order_id)
+    DISTRIBUTED BY HASH(order_id) BUCKETS 16
+    PROPERTIES ("enable_unique_key_merge_on_write" = "true");
+    ```
+  </Tab>
+  <Tab title="Merge-on-Read">
+    Without Merge-on-Write, duplicate resolution happens at **read time** by merging rowsets during a query. This reduces write amplification but increases query latency for point lookups.
+
+    ```sql
+    CREATE TABLE orders_mor (
+        order_id   BIGINT,
+        status     VARCHAR(20),
+        amount     DECIMAL(10,2),
+        updated_at DATETIME
+    )
+    UNIQUE KEY(order_id)
+    DISTRIBUTED BY HASH(order_id) BUCKETS 16;
+    ```
+  </Tab>
+</Tabs>
+
+<Tip>
+Use Merge-on-Write for new tables. The read performance advantage is significant for analytical queries that scan large ranges, and partial column updates are only supported in Merge-on-Write mode.
+</Tip>
+
+### Partial column updates
+
+Merge-on-Write Unique Key tables support updating a subset of columns without supplying the full row:
+
+```sql
+-- Update only the status and updated_at columns for an existing order
+INSERT INTO orders (order_id, status, updated_at)
+VALUES (12345, 'SHIPPED', NOW())
+/*+ SET_VAR(enable_unique_key_partial_update=true) */;
+```
+
+## Aggregate Key model
+
+The Aggregate Key model pre-aggregates rows that share the same key at write time (and during compaction). Non-key columns each carry an **aggregate function** that defines how values are combined when two rows have the same key.
+
+**Best for**: pre-computed metrics dashboards, site analytics (page views, unique visitors), financial roll-ups, or any use case where you need SUM/MAX/MIN/COUNT semantics and exact deduplication is not required.
+
+Supported aggregate functions:
+
+| Function      | Behavior                                                    |
+| ------------- | ----------------------------------------------------------- |
+| `SUM`         | Accumulates the sum of all values for the key               |
+| `MAX`         | Retains the maximum value seen for the key                  |
+| `MIN`         | Retains the minimum value seen for the key                  |
+| `REPLACE`     | Keeps the latest value (last write wins, by load sequence)  |
+| `HLL_UNION`   | Merges HyperLogLog sketches for approximate distinct counts |
+| `BITMAP_UNION`| Merges Bitmap structures for exact distinct counts          |
+
+```sql
+CREATE TABLE site_stats (
+    site_id  INT,
+    stat_date DATE,
+    pv       BIGINT         SUM,
+    uv       BIGINT         HLL_UNION,
+    revenue  DECIMAL(10,2)  SUM
+)
+AGGREGATE KEY(site_id, stat_date)
+DISTRIBUTED BY HASH(site_id) BUCKETS 8;
+```
+
+<Note>
+Internally, the Aggregate Key model is treated as part of the aggregation family alongside the Unique Key model (see `KeysType.isAggregationFamily()` in `fe/fe-core/src/main/java/org/apache/doris/catalog/KeysType.java`). Both models store a value column with an associated aggregation type and merge rows during compaction and reads.
+</Note>
+
+### Querying approximate distinct counts with HLL
+
+```sql
+-- Approximate UV using HLL_UNION
+SELECT site_id, HLL_CARDINALITY(uv) AS approx_uv
+FROM site_stats
+WHERE stat_date = '2025-01-01'
+GROUP BY site_id;
+```
+
+## Model comparison
+
+| Model         | Duplicate rows retained | Supports row-level update | Pre-aggregation | Typical use case                     |
+| ------------- | ----------------------- | ------------------------- | --------------- | ------------------------------------ |
+| Duplicate Key | Yes                     | No                        | No              | Raw logs, time-series, event streams |
+| Unique Key    | No (latest wins)        | Yes (upsert + delete)     | No              | CDC from OLTP, dimension tables      |
+| Aggregate Key | No (merged by key)      | Partial (via SUM/REPLACE) | Yes             | Metrics roll-ups, pre-aggregated KPIs|
+
+## Choosing a model
+
+<AccordionGroup>
+  <Accordion title="I'm ingesting raw logs or IoT sensor data">
+    Use the **Duplicate Key** model. You want every record preserved. Define the sort key on the timestamp column and a high-cardinality identifier (e.g., `DUPLICATE KEY(ts, device_id)`) to enable efficient range scans.
+  </Accordion>
+  <Accordion title="I'm syncing a MySQL table via Flink CDC">
+    Use the **Unique Key** model with `enable_unique_key_merge_on_write = true`. Map the MySQL primary key to the Doris `UNIQUE KEY`. Flink CDC will emit insert/update/delete events that Doris applies as upserts and deletes on the primary key.
+  </Accordion>
+  <Accordion title="I need a pre-aggregated metrics table for dashboards">
+    Use the **Aggregate Key** model. Define `SUM` on counter columns and `HLL_UNION` or `BITMAP_UNION` on distinct-count columns. This allows your reporting queries to scan far fewer rows because aggregation is performed during ingestion and compaction.
+  </Accordion>
+  <Accordion title="I need both upserts and pre-aggregation">
+    Consider a **Unique Key** table for the raw layer and a **Materialized View** built on top of it for the aggregated reporting layer. Doris synchronous single-table materialized views are maintained automatically.
+  </Accordion>
+</AccordionGroup>

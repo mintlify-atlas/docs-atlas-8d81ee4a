@@ -1,0 +1,242 @@
+---
+title: 'Query optimization'
+description: 'Use statistics, hints, and tuning techniques to get maximum performance from Apache Doris.'
+keywords: ['query optimization', 'statistics', 'explain', 'partition pruning', 'runtime filter', 'sort key', 'query hints', 'profile']
+---
+
+Doris uses the Nereids cost-based optimizer (CBO). The optimizer's plan quality depends on accurate statistics, correct table design, and occasionally manual hints to override its decisions.
+
+## Collect table statistics
+
+The CBO needs column-level statistics — row count, NDV (number of distinct values), nulls, min/max — to estimate cardinalities and choose the optimal join order and strategy. Without statistics, the optimizer may make poor decisions.
+
+```sql
+-- Synchronous full analyze (blocks until complete)
+ANALYZE TABLE orders WITH SYNC;
+
+-- Analyze specific columns only (faster for wide tables)
+ANALYZE TABLE orders (order_id, user_id, status, order_date) WITH SYNC;
+
+-- Asynchronous analyze (runs in background; default without WITH SYNC)
+ANALYZE TABLE order_items;
+
+-- Schedule auto-analyze: re-analyze when the table has grown by 100,000 rows
+ALTER TABLE orders SET TBLPROPERTIES(
+    "auto_analyze_job_record_count" = "100000"
+);
+
+-- Check current column statistics
+SHOW COLUMN STATS orders;
+
+-- Show per-table analyze job history
+SHOW ANALYZE orders;
+```
+
+<Tip>
+Run `ANALYZE TABLE` after the initial data load, after large batch inserts, and whenever `EXPLAIN` shows unexpectedly high or low row estimates. Accurate statistics are the single most impactful optimization for multi-table queries.
+</Tip>
+
+### What statistics affect
+
+| Statistic | Impact |
+|---|---|
+| Row count | Determines broadcast vs. shuffle join threshold |
+| NDV per column | Join order; runtime filter type selection (Bloom vs. In-list) |
+| Null count | Null-aware join planning |
+| Min / max | Partition pruning; min-max runtime filter generation |
+
+## EXPLAIN plans
+
+`EXPLAIN` shows the execution plan the optimizer chose. Read it to understand join strategies, scan ranges, and estimated row counts.
+
+```sql
+-- Logical plan with row estimates and costs
+EXPLAIN SELECT * FROM orders o JOIN customers c ON o.user_id = c.user_id;
+
+-- Physical plan including join strategy, distribution, and runtime filter details
+EXPLAIN VERBOSE SELECT ...;
+
+-- Actual row counts and timing after execution (query runs first)
+EXPLAIN ANALYZE SELECT ...;
+
+-- Compact shape — useful for quickly spotting unwanted full scans or bad join orders
+EXPLAIN SHAPE PLAN SELECT ...;
+```
+
+Key fields to look for:
+
+| Field in output | What it tells you |
+|---|---|
+| `HASH JOIN [BROADCAST]` | Join strategy: BROADCAST, PARTITIONED (shuffle), BUCKET_SHUFFLE, or COLOCATE |
+| `cardinality=N` | Optimizer's estimated row count for that node |
+| `runtime filters: RF000[bloom]` | Runtime filter being pushed to a scan node |
+| `partitions=N/M` | Partitions selected after pruning (N out of M total) |
+| `Hint log: Used/UnUsed/SyntaxError` | Whether hints were applied |
+
+The NereidsPlanner pipeline — visible in `EXPLAIN ALL PLAN` — runs: parse → analyze → rewrite → optimize → distribute. Slow plans are usually caused by bad statistics leading to a wrong join order in the optimize stage.
+
+## Partition pruning
+
+Doris stores data in physical partitions. Filtering on the partition column at query time tells the storage engine to skip entire partitions, which can cut scan time by orders of magnitude.
+
+```sql
+-- Good: direct equality on the partition column
+-- Doris reads only the 2024-01-15 partition
+SELECT * FROM events WHERE event_date = '2024-01-15';
+
+-- Good: range on partition column — prunes to the matching range
+SELECT * FROM events WHERE event_date BETWEEN '2024-01-01' AND '2024-01-31';
+
+-- Bad: function wrapping the partition column defeats pruning
+-- Doris cannot evaluate DATE(event_time) at the partition level
+-- and must scan ALL partitions
+SELECT * FROM events WHERE DATE(event_time) = '2024-01-15';
+```
+
+<Warning>
+Wrapping a partition column in any scalar function — `DATE()`, `YEAR()`, `CAST()`, `TO_DATE()`, etc. — disables partition pruning. Always filter on the raw partition column. Use a dedicated `DATE` column as the partition key if you ingest `DATETIME` data.
+</Warning>
+
+Check pruning effectiveness in `EXPLAIN`:
+
+```sql
+EXPLAIN SELECT * FROM events WHERE event_date = '2024-01-15';
+-- Look for: partitions=1/36 (selected 1 out of 36 total)
+```
+
+## Runtime filters
+
+Runtime filters are predicates built from the **build** side of a hash join and injected into the **probe** side's scan before it starts. This is automatic — no SQL changes needed. Use `EXPLAIN VERBOSE` to verify they are working.
+
+Three filter types are generated based on the join key's cardinality:
+
+- **Bloom filter** — probabilistic membership; best for high-cardinality keys (user IDs, order IDs).
+- **Min-Max filter** — range predicate; best when the build side's key range prunes well.
+- **In-list filter** — exact set membership; best for low-cardinality keys (status codes, regions) up to 1,024 distinct values.
+
+```sql
+EXPLAIN VERBOSE
+SELECT f.*, d.category_name
+FROM fact_sales f
+JOIN dim_products d ON f.product_id = d.product_id
+WHERE f.sale_date >= '2024-01-01';
+```
+
+In the output, scan nodes on `fact_sales` should show something like:
+
+```
+runtime filters: RF000[bloom] <- d.product_id, RF001[min_max] <- d.product_id
+```
+
+If runtime filters are absent when you expect them, check:
+1. Statistics exist on the join key columns.
+2. The join is a hash join, not a nested loop join.
+3. `enable_runtime_filter_prune` session variable is `true` (default).
+
+## Sort key optimization
+
+Doris auto-creates a **prefix index** (shortkey index) on the first 36 bytes of the sort key (the columns listed in `DUPLICATE KEY`, `AGGREGATE KEY`, etc.). This is a coarse-grained block-level index — a range scan on the first sort key column is very fast.
+
+Design guidelines:
+
+- Put the column you filter on most frequently **first** in the key.
+- For time-series data, `(date_col, user_id)` as the sort key means date-range filters are fast.
+- The prefix index only accelerates prefix predicates. A filter on the second key column without filtering the first does **not** use the prefix index.
+
+```sql
+-- Good: query filters on the leading sort key column (event_date)
+-- prefix index is used
+SELECT * FROM events WHERE event_date = '2024-01-15' AND user_id = 12345;
+
+-- Suboptimal: query filters only on user_id (not the leading key)
+-- full bucket scan within relevant partitions
+SELECT * FROM events WHERE user_id = 12345;
+```
+
+For columns not in the sort key, create a **Bloom filter index** to accelerate point lookups:
+
+```sql
+ALTER TABLE events ADD INDEX idx_user_id (user_id) USING BLOOM_FILTER
+PROPERTIES ("bloom_filter_fpp" = "0.01");
+```
+
+## Query hints
+
+### SET_VAR inline hint
+
+Override session variables for a single query without changing the session state:
+
+```sql
+SELECT /*+ SET_VAR(exec_mem_limit=10737418240, parallel_fragment_exec_instance_num=4) */
+    user_id,
+    COUNT(*) AS event_count,
+    SUM(amount) AS total_spend
+FROM large_events
+WHERE event_date >= '2024-01-01'
+GROUP BY user_id
+ORDER BY total_spend DESC
+LIMIT 1000;
+```
+
+This is useful when running a known-heavy query from an application that cannot change session state.
+
+### Join strategy hints
+
+See [Joins and multi-table queries](/query/joins) for the full join hint reference. Example:
+
+```sql
+SELECT /*+ BROADCAST(dim) */ f.sale_date, dim.category_name, SUM(f.amount)
+FROM fact_sales f
+JOIN dim_products dim ON f.product_id = dim.product_id
+GROUP BY f.sale_date, dim.category_name;
+```
+
+## Common performance tips
+
+| Tip | Why it matters |
+|---|---|
+| Use `LIMIT` when exploring data | Prevents accidentally scanning billions of rows during ad-hoc analysis |
+| Avoid `SELECT *` on wide tables | Reads all columns from storage; column pruning is most effective with explicit column lists |
+| Use `APPROX_COUNT_DISTINCT` or `HLL_UNION_AGG` for large distinct counts | Both avoid sorting and dedup steps; `APPROX_COUNT_DISTINCT` maps to the `ndv` function internally |
+| Use `BITMAP_UNION_COUNT` for pre-computed set operations | Bitmaps compress user sets and support fast union/intersection without scanning raw rows |
+| Match the data model to query patterns | `DUPLICATE KEY` for raw append-only logs; `AGGREGATE KEY` for pre-summarized metrics; `UNIQUE KEY` / `PRIMARY KEY` for mutable records |
+| Set bucket count to `total_data_size / 1 GB` | Under-bucketing creates large tablets (slow scans); over-bucketing creates too many small tablets (high overhead). Target 1–10 GB per bucket |
+| Partition time-series tables by date | Enables partition pruning and makes data lifecycle management (DROP PARTITION) instant |
+| Co-locate frequently-joined tables | Set `colocate_with` to the same group name to eliminate network shuffle — the biggest join cost in distributed databases |
+
+## Profile analysis
+
+For deep performance investigation, Doris records a per-fragment, per-operator execution profile for every query.
+
+### Access the web UI
+
+Navigate to `http://<fe_host>:8030` in a browser. Go to **Query** → find your query by ID or recency → click **Profile**. The profile shows:
+
+- Total query time broken down by planning, scheduling, and execution phases.
+- Per-fragment timings.
+- Per-operator row counts, time spent, and memory usage.
+- I/O statistics: bytes read from disk vs. cache.
+
+### Enable profiling programmatically
+
+```sql
+-- Enable profile collection for the current session
+SET enable_profile = true;
+
+-- After running your query, retrieve the profile
+SHOW QUERY PROFILE '/';
+
+-- Get profile for a specific query ID
+SHOW QUERY PROFILE '/<query_id>';
+```
+
+### Reading a profile
+
+Key metrics to focus on:
+
+| Metric | What to look for |
+|---|---|
+| `ScanRows` vs. `FilteredRows` | Large gap means runtime filters or partition pruning is working well. No gap means filters are not being applied. |
+| `NetworkSendTime` / `NetworkReceiveTime` | High values indicate shuffle-heavy queries — consider colocate join or better distribution key |
+| `HashJoinBuildTime` | Very high values mean the build side is large — consider switching to shuffle join or increasing memory |
+| `PeakMemoryUsage` | If near `exec_mem_limit`, the query may spill to disk or fail — increase the limit or reduce data volume with better pruning |

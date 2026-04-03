@@ -1,0 +1,229 @@
+---
+title: "Storage Engine"
+description: Columnar storage, index types, partitioning, and compaction in Apache Doris.
+keywords: ["storage engine", "columnar", "tablet", "index", "partitioning", "compaction", "rowset", "segment"]
+---
+
+The Apache Doris storage engine is built for analytical workloads. Data is stored in a columnar format, organized into tablets, indexed with multiple complementary index structures, and kept efficient over time by a background compaction process.
+
+## Columnar storage
+
+Doris stores data **column by column** rather than row by row. A query that reads only 5 out of 100 columns in a table physically reads only those 5 column files, dramatically reducing IO for analytical scans.
+
+Within each column, Doris applies encoding and compression suited to the data type:
+
+| Encoding type        | Applied to                              | Effect                                       |
+| -------------------- | --------------------------------------- | -------------------------------------------- |
+| Run-length encoding  | Columns with many repeated values       | Stores (value, count) pairs instead of raw data |
+| Dictionary encoding  | Low-cardinality string columns          | Replaces strings with small integer codes    |
+| Bitshuffle encoding  | Numeric columns (INT, BIGINT, FLOAT)    | Groups bits by significance for better LZ4/Zstd compression |
+| Plain encoding       | High-cardinality or mixed-type columns  | Stores raw bytes                             |
+
+The combination of columnar layout and per-column encoding typically achieves **3–10× compression ratios** compared to row-oriented storage, reducing both disk usage and the volume of data read from disk per query.
+
+## Tablet architecture
+
+A Doris table is horizontally partitioned into **tablets** — the smallest physical unit of storage and replication.
+
+```
+Table
+ ├── Partition p_2025_01  (RANGE partition by date)
+ │    ├── Tablet 10001  → replicas on BE-1, BE-2, BE-3
+ │    ├── Tablet 10002  → replicas on BE-1, BE-3, BE-4
+ │    └── ...
+ └── Partition p_2025_02
+      ├── Tablet 10050  → replicas on BE-2, BE-3, BE-4
+      └── ...
+```
+
+Each tablet is replicated across multiple BE nodes (typically 3). Reads can be served from any replica; writes go to all replicas with quorum acknowledgment.
+
+Within a tablet, data is stored as one or more **rowsets**. Each rowset consists of one or more **segments** (files on disk). A segment is the unit written by a single load transaction. Over time, the compaction process merges multiple rowsets into fewer, larger ones.
+
+## Index types
+
+Doris maintains several complementary index structures. Most are created automatically; some require explicit DDL.
+
+<AccordionGroup>
+  <Accordion title="Sorted compound key (prefix index)">
+    **Automatically created.** The rows within each tablet are sorted by the `DUPLICATE KEY`, `UNIQUE KEY`, or `AGGREGATE KEY` columns declared at table creation. A sparse prefix index is built on the sort key columns (up to 36 bytes, covering up to 3 key columns by default).
+
+    Every 1,024 rows, the first key value is recorded in the prefix index. A range query or point lookup on the sort key prefix can binary-search the prefix index to skip directly to the relevant 1 KB block, avoiding a full segment scan.
+
+    **Best for**: range queries and equality queries on the leading sort key column(s). Highly concurrent reporting queries on known dimensions benefit the most.
+  </Accordion>
+  <Accordion title="ZoneMap index">
+    **Automatically created** for every column in every data page. Records the minimum and maximum value observed in each data block (default block size: 1,024 rows).
+
+    During a query with a range or equality predicate on a column, Doris skips any block whose ZoneMap `[min, max]` range does not overlap the predicate. This is effective for columns that have monotonic or near-monotonic distributions (e.g., timestamps).
+
+    **Best for**: range predicates (`WHERE ts BETWEEN ... AND ...`, `WHERE amount > 1000`). Zero overhead — no configuration required.
+  </Accordion>
+  <Accordion title="BloomFilter index">
+    **Explicitly created.** A Bloom filter is built per data block (1,024 rows) for the specified column. On an equality predicate, Doris checks the Bloom filter before reading the block; if the filter says the value is definitely absent, the block is skipped.
+
+    ```sql
+    CREATE TABLE user_events (
+        user_id  BIGINT,
+        event    VARCHAR(64),
+        ts       DATETIME
+    )
+    DUPLICATE KEY(ts, user_id)
+    DISTRIBUTED BY HASH(user_id) BUCKETS 16
+    PROPERTIES (
+        "bloom_filter_columns" = "user_id"
+    );
+    ```
+
+    **Best for**: equality lookups on high-cardinality columns that are not the sort key (e.g., user IDs, order IDs, UUIDs). The false-positive rate is ~1%; there are zero false negatives.
+  </Accordion>
+  <Accordion title="Inverted index">
+    **Explicitly created.** Supports full-text search (tokenized keyword search) as well as non-tokenized arbitrary field equality and range queries across any column type, including strings, numerics, and arrays.
+
+    ```sql
+    CREATE INDEX idx_log_message ON log_events (message)
+    USING INVERTED
+    PROPERTIES ("parser" = "english");
+    ```
+
+    Inverted index entries are stored in separate index segment files alongside data segment files (see `be/src/storage/index/inverted/` for the implementation).
+
+    **Best for**: log analysis, full-text search, and ad-hoc filtering on columns that are not covered by the sort key.
+  </Accordion>
+  <Accordion title="NGram BloomFilter index">
+    **Explicitly created.** Splits string values into N-character n-grams and stores each n-gram in a Bloom filter per data block. A `LIKE '%substring%'` predicate can be accelerated by checking whether all n-grams of the substring appear in the block's filter.
+
+    ```sql
+    CREATE INDEX idx_url_ngram ON access_log (url)
+    USING NGRAM_BF
+    PROPERTIES ("gram_size" = "4", "bf_size" = "1024");
+    ```
+
+    **Best for**: substring (`LIKE '%...%'`) search on string columns, particularly URLs, log messages, and product descriptions.
+  </Accordion>
+</AccordionGroup>
+
+## Partitioning
+
+Partitioning divides a table into independent data ranges, enabling Doris to skip entire partitions that do not satisfy a query's `WHERE` clause (partition pruning).
+
+### Range partitioning
+
+The most common partitioning strategy. Data is assigned to partitions based on whether the partition key value falls within a declared range.
+
+```sql
+CREATE TABLE sales (
+    order_date  DATE,
+    order_id    BIGINT,
+    amount      DECIMAL(10,2)
+)
+DUPLICATE KEY(order_date, order_id)
+PARTITION BY RANGE(order_date) (
+    PARTITION p_2025_01 VALUES LESS THAN ("2025-02-01"),
+    PARTITION p_2025_02 VALUES LESS THAN ("2025-03-01"),
+    PARTITION p_2025_03 VALUES LESS THAN ("2025-04-01")
+)
+DISTRIBUTED BY HASH(order_id) BUCKETS 16;
+```
+
+### List partitioning
+
+Assigns rows to partitions based on exact value membership.
+
+```sql
+CREATE TABLE region_sales (
+    region      VARCHAR(20),
+    sale_id     BIGINT,
+    amount      DECIMAL(10,2)
+)
+DUPLICATE KEY(region, sale_id)
+PARTITION BY LIST(region) (
+    PARTITION p_us   VALUES IN ("US", "CA"),
+    PARTITION p_eu   VALUES IN ("DE", "FR", "UK"),
+    PARTITION p_apac VALUES IN ("CN", "JP", "KR")
+)
+DISTRIBUTED BY HASH(sale_id) BUCKETS 8;
+```
+
+### Dynamic partitioning
+
+Doris can automatically create and drop partitions on a schedule. Enable dynamic partitioning on a table to avoid manual partition management for time-series data:
+
+```sql
+PROPERTIES (
+    "dynamic_partition.enable"         = "true",
+    "dynamic_partition.time_unit"      = "DAY",
+    "dynamic_partition.start"          = "-30",
+    "dynamic_partition.end"            = "7",
+    "dynamic_partition.prefix"         = "p",
+    "dynamic_partition.buckets"        = "16"
+)
+```
+
+This keeps 30 days of history and pre-creates 7 days of future partitions. Partitions older than the `start` offset are dropped automatically.
+
+## Bucketing
+
+Within each partition, data is further divided into **buckets** (sub-partitions) that are distributed across BE nodes. Each bucket corresponds to one or more tablets.
+
+<Tabs>
+  <Tab title="HASH bucketing">
+    Rows are assigned to a bucket by computing `hash(bucket_key_columns) % num_buckets`. Rows with the same hash land in the same bucket and the same tablet, which makes co-located joins and aggregations faster.
+
+    ```sql
+    DISTRIBUTED BY HASH(user_id) BUCKETS 32
+    ```
+
+    **Choosing bucket count**: aim for each bucket to hold 1–10 GB of data after accounting for replicas. For a 1 TB table with 3 replicas, 32–64 buckets is a reasonable starting point.
+  </Tab>
+  <Tab title="RANDOM bucketing">
+    Rows are assigned to buckets randomly (round-robin). This avoids hot-bucket problems when there is no good natural partition key, and it achieves better write parallelism.
+
+    ```sql
+    DISTRIBUTED BY RANDOM BUCKETS 32
+    ```
+
+    RANDOM bucketing does not support co-located joins. Use it for tables that are primarily written and scanned in bulk without join co-location requirements.
+  </Tab>
+</Tabs>
+
+<Warning>
+Bucket count cannot be changed after table creation. If you are unsure, err on the side of more buckets (up to a limit of 128 per partition for most clusters). Each bucket incurs a small overhead at query planning time.
+</Warning>
+
+## Compaction
+
+Each load transaction writes a new **rowset** into the affected tablets. Over time, many small rowsets accumulate. Compaction is the background process that merges rowsets to:
+
+- Reduce the number of files that reads must scan
+- Apply pending deletes and tombstones
+- Merge duplicate/aggregate key rows (for Unique and Aggregate models)
+- Reclaim disk space from deleted data
+
+Doris runs two types of compaction concurrently, implemented in `be/src/storage/compaction/`:
+
+<Steps>
+  <Step title="Cumulative compaction">
+    Merges recently written rowsets (the "delta" layer) into a single, larger cumulative rowset. Runs frequently and targets small, newly written rowsets. Corresponds to `cumulative_compaction.h` / `cumulative_compaction.cpp`.
+
+    Two policies govern which rowsets are selected:
+    - **Size-based policy** (default): picks rowsets when their combined size crosses a threshold.
+    - **Time-series policy**: picks rowsets based on age, suitable for time-series tables where recent data is written in small batches.
+  </Step>
+  <Step title="Base compaction">
+    Merges the cumulative rowset down into the single base rowset for the tablet. Runs less frequently (triggered when cumulative compaction has produced enough data). Produces the most compact representation of the tablet's current state. Corresponds to `base_compaction.h` / `base_compaction.cpp`.
+  </Step>
+</Steps>
+
+<Note>
+You do not need to trigger compaction manually in normal operation. Doris automatically schedules compaction tasks via the adaptive thread pool controller (`adaptive_thread_pool_controller.h`). You can monitor compaction status with `SHOW PROC '/compaction_status';`.
+</Note>
+
+### Full compaction
+
+For special maintenance operations (e.g., reclaiming disk space after bulk deletes), a **full compaction** (`full_compaction.h`) merges all rowsets in a tablet into a single rowset in one pass. This is a heavy operation and is not run automatically.
+
+```sql
+-- Trigger full compaction on a specific tablet (for maintenance)
+ADMIN COMPACT TABLE sales PARTITION (p_2025_01);
+```

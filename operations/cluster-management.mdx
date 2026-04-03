@@ -1,0 +1,208 @@
+---
+title: "Cluster Management"
+description: Scale, configure, and manage Apache Doris FE and BE nodes.
+---
+
+## Cluster topology
+
+A production Doris cluster separates query planning (Frontend) from storage and execution (Backend). The recommended minimum topology is:
+
+- **1 Master FE** — accepts writes, coordinates metadata
+- **2 Follower FEs** — replicate metadata via BDB JE; any follower can be elected master
+- **≥ 3 BE nodes** — store tablet replicas (default replication factor is 3)
+
+<Note>
+Run at least 3 BE nodes so every tablet can maintain 3 replicas. Fewer nodes prevent full replication and block data loading for tables with the default replication factor.
+</Note>
+
+```
+┌──────────────────────────────────────────────────┐
+│  Clients / BI Tools (MySQL protocol :9030)       │
+└─────────────────┬────────────────────────────────┘
+                  │
+     ┌────────────▼────────────┐
+     │   FE Master (:8030)     │
+     │   FE Follower x2        │
+     └────────────┬────────────┘
+                  │  BDB JE replication (:9010)
+     ┌────────────▼────────────┐
+     │  BE-1  BE-2  BE-3 ...   │
+     │  heartbeat :9050        │
+     └─────────────────────────┘
+```
+
+---
+
+## Adding a BE node
+
+<Steps>
+  <Step title="Start the BE process on the new host">
+    Ensure `heartbeat_service_port = 9050` is set in `be.conf` and the process is running.
+  </Step>
+  <Step title="Register the BE with the cluster">
+    Connect to any FE with the MySQL client and run:
+
+    ```sql
+    ALTER SYSTEM ADD BACKEND "be-host:9050";
+    ```
+  </Step>
+  <Step title="Verify the node is alive">
+    ```sql
+    SHOW BACKENDS\G
+    ```
+
+    Check that `Alive` is `true` and `TabletNum` begins increasing as tablets are balanced onto the new node.
+  </Step>
+</Steps>
+
+---
+
+## Adding a FE node
+
+Doris supports two non-master FE roles:
+
+- **Follower** — participates in leader election; maintains a full metadata replica
+- **Observer** — read-only; does not vote in elections; used to scale out query connections
+
+```sql
+-- Add a Follower
+ALTER SYSTEM ADD FOLLOWER "fe-host:9010";
+
+-- Add an Observer
+ALTER SYSTEM ADD OBSERVER "fe-host:9010";
+
+-- Verify
+SHOW FRONTENDS\G
+```
+
+The port `9010` is the `edit_log_port` used for BDB JE log synchronization (set in `fe.conf`).
+
+<Note>
+Start the new FE process with `--helper <existing-fe-host>:<edit_log_port>` so it can bootstrap from an existing FE's metadata.
+</Note>
+
+---
+
+## Decommissioning a BE node
+
+Decommissioning migrates all tablet replicas off a BE before removing it. This is the safe path for planned maintenance.
+
+```sql
+-- Initiate graceful decommission
+ALTER SYSTEM DECOMMISSION BACKEND "be-host:9050";
+
+-- Monitor progress — wait until TabletNum reaches 0
+SHOW BACKENDS\G
+```
+
+The BE is automatically dropped once all tablets have been redistributed. This can take minutes to hours depending on data volume.
+
+<Warning>
+Do not forcibly drop a node while decommission is in progress. Doing so may leave tablets under-replicated until the cluster self-heals.
+</Warning>
+
+---
+
+## Dropping a BE node
+
+Use this only for emergency removal (e.g., a failed host that cannot be recovered). Replicas on the dropped node are immediately lost.
+
+```sql
+ALTER SYSTEM DROPP BACKEND "be-host:9050";
+```
+
+<Warning>
+If the number of surviving replicas for any tablet falls below `min_load_replica_num`, queries against those tablets will fail until the cluster replicates them onto other nodes.
+</Warning>
+
+---
+
+## Checking cluster status
+
+```sql
+-- BE nodes: liveness, tablet count, disk usage
+SHOW BACKENDS\G
+
+-- FE nodes: role, liveness, replayed journal ID
+SHOW FRONTENDS\G
+
+-- Tablet health summary
+SHOW TABLET DIAGNOSIS;
+```
+
+Key columns to watch in `SHOW BACKENDS\G`:
+
+| Column | Meaning |
+|--------|---------|
+| `Alive` | Whether the FE can reach the BE via heartbeat |
+| `TabletNum` | Number of tablets hosted on this BE |
+| `DataUsedCapacity` | Bytes of actual data stored |
+| `AvailCapacity` | Free disk space remaining |
+| `SystemDecommissioned` | `true` when decommission is in progress |
+
+---
+
+## Storage configuration
+
+Configure data directories in `be.conf`. Multiple paths can be listed, separated by `;`. Specify the storage medium so Doris can route hot data to SSD and cold data to HDD:
+
+```ini
+# be.conf
+storage_root_path = /data1/doris,medium:SSD;/data2/doris,medium:HDD
+```
+
+- Paths must exist and be writable before starting BE.
+- Default is `${DORIS_HOME}/storage` when `storage_root_path` is not set.
+- Adding new paths to a running BE requires a restart; tablets are not automatically moved to the new path.
+
+---
+
+## Tablet rebalancing
+
+Doris rebalances tablets automatically when node capacity diverges. To trigger a manual rebalance:
+
+```sql
+ADMIN REBALANCE;
+```
+
+<Tip>
+Rebalancing is I/O-intensive. Schedule it during off-peak hours on busy clusters.
+</Tip>
+
+---
+
+## Key FE configuration
+
+These options are set in `fe.conf` (see `conf/fe.conf` in the source tree):
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `http_port` | `8030` | FE HTTP port — Web UI and REST API |
+| `query_port` | `9030` | MySQL-compatible query port |
+| `rpc_port` | `9020` | Internal FE RPC port |
+| `edit_log_port` | `9010` | BDB JE replication port used for FE metadata sync |
+| `arrow_flight_sql_port` | `8070` | Arrow Flight SQL protocol port |
+| `meta_dir` | `${DORIS_HOME}/doris-meta` | Metadata storage path — must persist across restarts |
+| `sys_log_level` | `INFO` | Log verbosity: `INFO`, `WARN`, `ERROR`, `FATAL` |
+| `qe_max_connection` | `1024` | Maximum concurrent MySQL connections |
+| `qe_query_timeout_second` | `300` | Default query timeout in seconds |
+
+<Warning>
+`meta_dir` stores the BDB JE journal and catalog snapshots. Mount it on a durable, low-latency disk. Losing this directory on the master FE while followers are unavailable can result in unrecoverable metadata loss.
+</Warning>
+
+---
+
+## Key BE configuration
+
+These options are set in `be.conf` (see `conf/be.conf` in the source tree):
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `be_port` | `9060` | BE Thrift service port — FE-to-BE RPC |
+| `webserver_port` | `8040` | BE HTTP port — metrics and Web UI |
+| `heartbeat_service_port` | `9050` | Heartbeat port — used in `ALTER SYSTEM ADD BACKEND` |
+| `brpc_port` | `8060` | BE internal BRPC port — inter-BE data exchange |
+| `arrow_flight_sql_port` | `8050` | Arrow Flight SQL protocol port |
+| `storage_root_path` | `${DORIS_HOME}/storage` | Data directories with optional medium labels |
+| `sys_log_level` | `INFO` | Log verbosity: `INFO`, `WARNING`, `ERROR`, `FATAL` |

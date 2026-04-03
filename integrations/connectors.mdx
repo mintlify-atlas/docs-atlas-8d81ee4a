@@ -1,0 +1,308 @@
+---
+title: "Flink, Spark, and dbt connectors"
+description: "Integrate Apache Doris with Flink, Spark, and dbt for pipeline and transformation workflows."
+keywords: ["flink", "spark", "dbt", "connector", "cdc", "pipeline", "streaming", "batch"]
+---
+
+Doris provides first-party connectors for Apache Flink, Apache Spark, and dbt. All three integrate with the Doris Stream Load and HTTP APIs on the FE node (port 8030) and the MySQL-compatible query port (port 9030).
+
+<Tabs>
+  <Tab title="Flink">
+
+## Overview
+
+The Flink Doris Connector supports:
+
+- **Exactly-once writes** via Doris two-phase commit (2PC) on top of the Stream Load transaction API
+- **Change Data Capture (CDC) pipelines** — pair with Flink CDC sources (MySQL CDC, PostgreSQL CDC, etc.) for real-time replication into Doris
+- **Batch reads** from Doris using the Doris Thrift scan interface
+
+## Maven dependency
+
+```xml
+<dependency>
+    <groupId>org.apache.doris</groupId>
+    <artifactId>flink-doris-connector-1.18</artifactId>
+    <version>24.0.0</version>
+</dependency>
+```
+
+Choose the artifact that matches your Flink version. For Flink 1.15 or 1.16, replace `1.18` in the artifact ID accordingly.
+
+## Flink SQL sink
+
+<Steps>
+  <Step title="Create the Doris sink table">
+
+Define a Flink SQL table backed by Doris using the `doris` connector. The `sink.enable-2pc` option enables exactly-once delivery.
+
+```sql
+CREATE TABLE doris_sink (
+    order_id  BIGINT,
+    status    STRING,
+    amount    DECIMAL(10, 2),
+    PRIMARY KEY (order_id) NOT ENFORCED
+) WITH (
+    'connector'                  = 'doris',
+    'fenodes'                    = 'fe-host:8030',
+    'table.identifier'           = 'mydb.orders',
+    'username'                   = 'root',
+    'password'                   = '',
+    'sink.properties.format'     = 'json',
+    'sink.enable-2pc'            = 'true',
+    'sink.label-prefix'          = 'doris_flink_sink'
+);
+```
+
+  </Step>
+  <Step title="Insert data">
+
+Write to the Doris sink from any Flink SQL source:
+
+```sql
+INSERT INTO doris_sink
+SELECT order_id, status, amount FROM source_table;
+```
+
+  </Step>
+</Steps>
+
+## CDC pipeline: MySQL → Doris
+
+Use Flink CDC to capture row-level changes from MySQL and stream them into Doris in real time.
+
+```sql
+-- Declare the MySQL CDC source
+CREATE TABLE mysql_orders (
+    order_id  BIGINT PRIMARY KEY NOT ENFORCED,
+    status    STRING,
+    amount    DECIMAL(10, 2)
+) WITH (
+    'connector'     = 'mysql-cdc',
+    'hostname'      = 'mysql-host',
+    'port'          = '3306',
+    'username'      = 'root',
+    'password'      = 'secret',
+    'database-name' = 'mydb',
+    'table-name'    = 'orders'
+);
+
+-- Stream changes into Doris
+INSERT INTO doris_sink SELECT * FROM mysql_orders;
+```
+
+<Note>
+Flink CDC emits INSERT, UPDATE, and DELETE events. With `sink.enable-2pc = true` and a Doris Unique Key or Primary Key model table, all three event types are applied correctly. DELETE events are handled via Doris delete-sign mechanism.
+</Note>
+
+## Key connector options
+
+| Option | Description | Default |
+|---|---|---|
+| `fenodes` | FE host and HTTP port (8030) | — |
+| `table.identifier` | Target table in `db.table` format | — |
+| `username` / `password` | Doris credentials | — |
+| `sink.enable-2pc` | Enable exactly-once via two-phase commit | `false` |
+| `sink.properties.format` | Payload format: `json` or `csv` | `csv` |
+| `sink.buffer-flush.max-rows` | Rows buffered before a flush | `50000` |
+| `sink.buffer-flush.interval` | Flush interval in milliseconds | `10000` |
+| `sink.max-retries` | Retry attempts on write failure | `3` |
+
+  </Tab>
+  <Tab title="Spark">
+
+## Overview
+
+The Spark Doris Connector provides:
+
+- **Batch reads** from Doris with predicate pushdown via the Doris Thrift scan interface
+- **Batch writes** using the Doris Stream Load HTTP API
+- **DataFrame API and Spark SQL** support
+
+## Maven dependency
+
+```xml
+<dependency>
+    <groupId>org.apache.doris</groupId>
+    <artifactId>spark-doris-connector-3.4_2.12</artifactId>
+    <version>24.0.0</version>
+</dependency>
+```
+
+Choose the artifact for your Spark and Scala version. `3.4_2.12` targets Spark 3.4 with Scala 2.12.
+
+## Read from Doris
+
+Use the `doris` format in the DataFrame reader. The `doris.filter.query` option pushes a SQL predicate down to Doris, reducing data transfer.
+
+```python
+df = spark.read \
+    .format("doris") \
+    .option("doris.fenodes", "fe-host:8030") \
+    .option("doris.table.identifier", "mydb.orders") \
+    .option("user", "root") \
+    .option("password", "") \
+    .option("doris.filter.query", "status = 'COMPLETED'") \
+    .load()
+
+df.show()
+```
+
+### Spark SQL read
+
+```python
+spark.sql("""
+    CREATE TEMPORARY VIEW orders
+    USING doris
+    OPTIONS (
+        'doris.fenodes' = 'fe-host:8030',
+        'doris.table.identifier' = 'mydb.orders',
+        'user' = 'root',
+        'password' = ''
+    )
+""")
+
+spark.sql("SELECT order_date, SUM(amount) FROM orders GROUP BY order_date").show()
+```
+
+## Write to Doris
+
+Use `append` mode for new rows, or `overwrite` to truncate-and-reload the target table.
+
+```python
+df.write \
+    .format("doris") \
+    .option("doris.fenodes", "fe-host:8030") \
+    .option("doris.table.identifier", "mydb.orders") \
+    .option("user", "root") \
+    .option("password", "") \
+    .option("doris.sink.properties.format", "json") \
+    .option("doris.sink.batch.size", "10000") \
+    .mode("append") \
+    .save()
+```
+
+<Tip>
+Increase `doris.sink.batch.size` and `doris.sink.task.partition.size` for large bulk loads. The connector batches rows and sends them via Stream Load in parallel from each Spark executor.
+</Tip>
+
+## Key connector options
+
+| Option | Description | Default |
+|---|---|---|
+| `doris.fenodes` | FE host and HTTP port (8030) | — |
+| `doris.table.identifier` | Target table in `db.table` format | — |
+| `user` / `password` | Doris credentials | — |
+| `doris.filter.query` | SQL predicate pushed to Doris on reads | — |
+| `doris.sink.properties.format` | Stream Load format: `json` or `csv` | `csv` |
+| `doris.sink.batch.size` | Rows per Stream Load batch | `100000` |
+| `doris.sink.task.partition.size` | Parallelism for write tasks | — |
+| `doris.read.field` | Comma-separated list of columns to read | all columns |
+
+  </Tab>
+  <Tab title="dbt">
+
+## Overview
+
+The `dbt-doris` adapter lets you run SQL transformations inside Doris using dbt's model, seed, snapshot, and test abstractions. dbt connects to Doris over the MySQL protocol on port 9030.
+
+Supported features:
+
+- **Models** — incremental, table, and view materializations
+- **Seeds** — load CSV data into Doris tables
+- **Snapshots** — SCD Type 2 history tracking using Doris Unique Key tables
+- **Tests** — built-in and custom data quality tests
+- **Sources** — reference external catalog tables as dbt sources
+
+## Install
+
+```bash
+pip install dbt-doris
+```
+
+## Configure profiles.yml
+
+```yaml
+my_doris_project:
+  target: dev
+  outputs:
+    dev:
+      type: doris
+      host: doris-fe-host
+      port: 9030
+      schema: analytics
+      username: root
+      password: ""
+      thread: 4
+```
+
+## Project structure
+
+```
+my_doris_project/
+├── dbt_project.yml
+├── profiles.yml
+├── models/
+│   ├── staging/
+│   │   └── stg_orders.sql
+│   └── marts/
+│       └── daily_revenue.sql
+├── seeds/
+│   └── region_codes.csv
+└── tests/
+    └── assert_revenue_positive.sql
+```
+
+## Example model
+
+```sql
+-- models/daily_revenue.sql
+{{ config(materialized='table') }}
+
+SELECT
+    order_date,
+    SUM(amount)  AS daily_revenue,
+    COUNT(*)     AS order_count
+FROM {{ ref('orders') }}
+GROUP BY order_date
+```
+
+### Incremental model
+
+```sql
+-- models/incremental_events.sql
+{{ config(
+    materialized = 'incremental',
+    unique_key   = 'event_id'
+) }}
+
+SELECT event_id, user_id, event_type, created_at
+FROM {{ ref('raw_events') }}
+
+{% if is_incremental() %}
+    WHERE created_at > (SELECT MAX(created_at) FROM {{ this }})
+{% endif %}
+```
+
+## Run dbt
+
+```bash
+# Run all models
+dbt run
+
+# Run a single model
+dbt run --select daily_revenue
+
+# Test data quality
+dbt test
+
+# Generate and serve documentation
+dbt docs generate && dbt docs serve
+```
+
+<Tip>
+Use `dbt run --target prod` to switch between dev and prod Doris clusters without changing model SQL. Define multiple output entries in `profiles.yml`.
+</Tip>
+
+  </Tab>
+</Tabs>

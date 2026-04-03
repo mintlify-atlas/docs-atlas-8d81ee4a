@@ -1,0 +1,138 @@
+---
+title: "Architecture"
+description: Understand Apache Doris's FE/BE architecture, cluster topology, and deployment models.
+keywords: ["architecture", "frontend", "backend", "FE", "BE", "cluster", "deployment"]
+---
+
+Apache Doris uses a two-process architecture consisting of a **Frontend (FE)** and a **Backend (BE)**. There are no external dependencies — no ZooKeeper, no HDFS namenode, no external coordination service is required to run a Doris cluster.
+
+## Two-process architecture
+
+### Frontend (FE)
+
+The FE is a Java process responsible for:
+
+- Receiving and parsing SQL queries from clients (MySQL protocol)
+- Query planning and optimization via the Nereids optimizer
+- Metadata management (databases, tables, partitions, replicas)
+- Cluster node management and health monitoring
+
+FE nodes store metadata using **BDB JE (Berkeley DB Java Edition)**, an embedded Java database that provides the consensus protocol for metadata replication across FE nodes. No external consensus service (such as ZooKeeper) is needed.
+
+#### FE roles
+
+Multiple FE nodes can be deployed for high availability. Each FE maintains a full copy of all metadata. The three roles are:
+
+| Role     | Function                                                                                               | Participates in election |
+| -------- | ------------------------------------------------------------------------------------------------------ | ------------------------ |
+| Master   | Handles all metadata read/write operations. Synchronizes metadata changes to Followers and Observers via the BDB JE protocol. | Yes (is the elected leader) |
+| Follower | Reads metadata. Can be elected as the new Master if the current Master fails. Participates in quorum writes. | Yes |
+| Observer | Reads metadata. Used to scale out query concurrency. Does not participate in leader elections or quorum writes. | No |
+
+<Note>
+A production cluster typically runs 3 FE nodes (1 Master + 2 Followers) to tolerate a single FE failure. Observers can be added freely to increase query concurrency without affecting write quorum requirements.
+</Note>
+
+### Backend (BE)
+
+The BE is a C++ process responsible for:
+
+- Storing data on local disk in columnar format
+- Executing query plan fragments dispatched by the FE
+- Compaction of rowsets in the background
+- Managing tablet replicas
+
+BE nodes are stateless with respect to query routing — any BE can execute any fragment. Data is partitioned into tablets and distributed across BE nodes. Each tablet is stored with multiple replicas (typically 3) for fault tolerance.
+
+## Cluster topology
+
+The following table describes a representative production deployment:
+
+| Node type  | Recommended count | Role                                          |
+| ---------- | ----------------- | --------------------------------------------- |
+| FE Master  | 1                 | Metadata leader, query planning               |
+| FE Follower | 2               | Metadata standby, can become Master on failover |
+| FE Observer | 0–N             | Read-only, adds query concurrency             |
+| BE         | 3–N               | Data storage and query execution              |
+
+```
+Client (MySQL protocol)
+        │
+        ▼
+┌───────────────────────────────┐
+│  Frontend (FE) Layer          │
+│                               │
+│  ┌─────────┐  ┌───────────┐  │
+│  │ Master  │  │ Follower  │  │
+│  │  (RW)   │  │  (R + HA) │  │
+│  └────┬────┘  └─────┬─────┘  │
+│       │  BDB JE     │        │
+│       └──────┬──────┘        │
+└──────────────┼───────────────┘
+               │ Fragment dispatch
+               ▼
+┌─────────────────────────────────────────┐
+│  Backend (BE) Layer                      │
+│                                          │
+│  ┌──────┐  ┌──────┐  ┌──────┐          │
+│  │ BE 1 │  │ BE 2 │  │ BE 3 │  ...     │
+│  │Tablet│  │Tablet│  │Tablet│          │
+│  │Replica│ │Replica│ │Replica│          │
+│  └──────┘  └──────┘  └──────┘          │
+└─────────────────────────────────────────┘
+```
+
+## High availability and data reliability
+
+- **Metadata HA**: The FE Master replicates every metadata change to Follower nodes using the BDB JE consensus protocol. A majority quorum must acknowledge a write before it is committed, ensuring no metadata is lost if a minority of FE nodes fail.
+- **Data HA**: Each tablet is stored with multiple replicas across different BE nodes. A write is considered successful once a quorum of replicas acknowledge it. If a BE node fails, Doris automatically re-replicates the affected tablets to restore the configured replica count.
+- **Automatic recovery**: When a failed BE node rejoins the cluster, Doris reconciles its tablet state and re-syncs any missing data from peer replicas.
+
+## Horizontal scalability
+
+Both FE and BE processes scale horizontally:
+
+- **BE scale-out**: Add BE nodes and Doris will automatically rebalance tablets across the new nodes. Query parallelism increases accordingly.
+- **FE scale-out**: Add Observer FE nodes to handle more concurrent queries without touching the consensus group.
+
+A single Doris cluster can support hundreds of BE machines and tens of petabytes of storage capacity.
+
+## Storage-compute separation (Cloud mode)
+
+In the standard (storage-compute integrated) mode, data lives on local disks attached to BE nodes. Doris also supports a **storage-compute separation** (Cloud) mode in which:
+
+- The FE and BE processes remain the same.
+- BE compute nodes are **stateless** — they do not store data locally. Instead, data is stored in object storage (Amazon S3, HDFS, or compatible services).
+- Compute can scale independently of storage: add or remove BE nodes without moving data.
+- A shared cache layer on BE nodes keeps hot data local to avoid repeated remote reads.
+
+<Tip>
+Storage-compute separation is well-suited for cloud environments where storage and compute costs should be managed independently, or where workloads are bursty and compute needs to scale to zero during idle periods.
+</Tip>
+
+## Deployment checklist
+
+<Steps>
+  <Step title="Plan FE topology">
+    Deploy at least 3 FE nodes (1 Master, 2 Followers) for production high availability. Add Observers only after the consensus group is stable.
+  </Step>
+  <Step title="Plan BE topology">
+    Deploy at least 3 BE nodes to support the default replication factor of 3. Ensure each BE node has dedicated SSDs for tablet storage.
+  </Step>
+  <Step title="Configure priority networks">
+    Set `priority_networks` in `be.conf` and `fe.conf` to match your internal network CIDR so Doris binds to the correct interface.
+  </Step>
+  <Step title="Register BE nodes">
+    After starting BE nodes, register each one from a connected FE with:
+    ```sql
+    ALTER SYSTEM ADD BACKEND "host:heartbeat_port";
+    ```
+  </Step>
+  <Step title="Verify cluster health">
+    ```sql
+    SHOW BACKENDS;
+    SHOW FRONTENDS;
+    ```
+    All nodes should show `Alive = true`.
+  </Step>
+</Steps>
